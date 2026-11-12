@@ -36,10 +36,24 @@ Resources:
           AttributeType: S
         - AttributeName: email
           AttributeType: S
+        - AttributeName: checkHour
+          AttributeType: S
+        - AttributeName: locKey
+          AttributeType: S
       KeySchema:
         - AttributeName: id
           KeyType: HASH
       GlobalSecondaryIndexes:
+        # The daily job Queries this instead of Scanning the table: only the
+        # subscriptions due at that hour, sorted (= grouped) by location.
+        - IndexName: ByCheckHour
+          KeySchema:
+            - AttributeName: checkHour
+              KeyType: HASH
+            - AttributeName: locKey
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
         - IndexName: ByEmail
           KeySchema:
             - AttributeName: email

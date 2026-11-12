@@ -30,9 +30,9 @@ By the end of this tutorial you'll have:
                                  │  geocode city (Open-Meteo)
                                  │  sns:Subscribe  + filter policy {subscriptionId:[id]}
                                  ▼
-                          DynamoDB: Subscriptions  (GSI ByEmail)
+                          DynamoDB: Subscriptions  (GSIs: ByEmail, ByCheckHour)
                                  ▲
- EventBridge Scheduler           │ Scan
+ EventBridge Scheduler           │ Query ByCheckHour = "07"
  cron(0 7 * * ? *)  ───────► CheckFunction (Lambda)
  America/Edmonton                │  1 forecast call per location (Open-Meteo)
                                  │  evaluate rules
@@ -49,7 +49,7 @@ By the end of this tutorial you'll have:
 | **EventBridge Scheduler** (not the older EventBridge *rule* with `schedule`) | Supports a **timezone**, so "7 a.m." stays 7 a.m. across daylight saving. Rules are UTC-only. Also has its own retry policy and DLQ. | Nothing meaningful — it's the newer, recommended option. |
 | **SNS email + filter policies** (not SES) | SNS sends the confirmation email, handles the **unsubscribe link**, and needs no domain verification or "SES sandbox" exit request. One shared topic, and a filter policy per subscription routes each message to one inbox. | Plain-text emails only, the "From" name is generic, and SNS email isn't designed for high volume. For a real product with HTML emails, move to SES. |
 | **Open-Meteo** (not OpenWeather etc.) | Free, **no API key**, so there's no secret to store in Secrets Manager. Has geocoding too. | Free tier is for non-commercial use and you must credit them (the email footer does). |
-| **DynamoDB on-demand** | Pay per request; zero cost when idle. | A daily `Scan` is fine for thousands of subscriptions, not millions (see "Scaling" below). |
+| **DynamoDB on-demand + a GSI** | Pay per request; zero cost when idle. A GSI lets the daily job `Query` only what's due, already grouped by city. | Every write also updates the index. At millions of rows, one `checkHour` value needs sharding (see "Scaling"). |
 | **Lambda on arm64 (Graviton)** | ~20% cheaper per GB-second than x86, and this code has no native dependencies. | None for pure JavaScript. |
 
 ---
@@ -77,10 +77,12 @@ src/rules.mjs          # pure alert logic — no AWS, unit tested
 src/weather.mjs        # Open-Meteo geocoding + forecast
 src/subscribe.mjs      # POST /subscriptions
 src/check.mjs          # daily scheduled job
+src/keys.mjs           # GSI key helpers — pure, unit tested
 test/rules.test.mjs
+test/keys.test.mjs
 ```
 
-There's **no `npm install`** for the Lambdas. Node.js 24 Lambda includes the AWS SDK v3 and a global `fetch`, so the deployment package is just these four files.
+There's **no `npm install`** for the Lambdas. Node.js 24 Lambda includes the AWS SDK v3 and a global `fetch`, so the deployment package is just these five files.
 
 ---
 
@@ -122,7 +124,11 @@ npm test
 ✔ missing forecast data never alerts
 ✔ validateRule rejects bad input
 ✔ formatAlert subject stays under the SNS 100-char limit
-ℹ pass 6
+✔ toCheckHour normalises to two digits and rejects bad hours
+✔ locKey rounds to ~1 km and appends the id
+✔ groupSorted groups adjacent items from a GSI-sorted Query
+✔ groupSorted handles an empty result
+ℹ pass 10
 ```
 
 > **Small snag:** my first `package.json` used `"test": "node --test test/"`. On Windows that ran zero tests and reported a failure. Plain `node --test` (which auto-discovers `*.test.mjs`) works on every OS.
@@ -204,6 +210,8 @@ const sub = await sns.send(new SubscribeCommand({
 await ddb.send(new PutCommand({
   TableName: TABLE_NAME,
   Item: { id, email, ...place, rule: { type: rule.type, threshold: rule.threshold },
+          // keys for the ByCheckHour GSI the daily job queries (Step 5)
+          checkHour: '07', locKey: locKey(place.latitude, place.longitude, id),
           snsSubscriptionArn: sub.SubscriptionArn, createdAt: new Date().toISOString() },
 }))
 ```
@@ -241,12 +249,54 @@ if ((existing.Count ?? 0) >= MAX_PER_EMAIL) return json(429, { error: `This emai
 
 ## Step 5 — The daily job
 
+The job must not read the whole table every morning. Instead, every subscription carries two extra attributes that feed a **global secondary index (GSI)**:
+
+| GSI `ByCheckHour` | Example | Answers |
+|---|---|---|
+| Partition key `checkHour` | `"07"` | *Which subscriptions are due at this hour?* |
+| Sort key `locKey` | `"51.05,-114.09#b780f6ac-…"` | Sorted by location (lat/lon rounded to ~1 km), then id |
+
+```js
+// src/keys.mjs — pure helpers, unit tested
+export const locKey = (lat, lon, id) => `${lat.toFixed(2)},${lon.toFixed(2)}#${id}`
+
+// Items arrive sorted by locKey, so same-city items are adjacent: one pass, no map.
+export function groupSorted(subs) {
+  const groups = []
+  for (const s of subs) {
+    const cell = s.locKey.slice(0, s.locKey.indexOf('#'))
+    const last = groups[groups.length - 1]
+    if (last && last.cell === cell) last.subs.push(s)
+    else groups.push({ cell, latitude: s.latitude, longitude: s.longitude, subs: [s] })
+  }
+  return groups
+}
+```
+
 ```js
 // src/check.mjs (core)
-export const handler = async () => {
-  const subs = await loadSubscriptions()        // paginated Scan
-  const groups = groupByLocation(subs)          // 50 people in Calgary → 1 forecast call
-  const stats = { subscriptions: subs.length, locations: groups.length, sent: 0, not_triggered: 0, already_sent: 0, failed: 0 }
+async function loadDueSubscriptions(checkHour) {
+  const items = []
+  let ExclusiveStartKey
+  do {
+    const page = await ddb.send(new QueryCommand({
+      TableName: TABLE_NAME,
+      IndexName: 'ByCheckHour',
+      KeyConditionExpression: 'checkHour = :h',
+      ExpressionAttributeValues: { ':h': checkHour },
+      ExclusiveStartKey,
+    }))
+    items.push(...(page.Items ?? []))
+    ExclusiveStartKey = page.LastEvaluatedKey
+  } while (ExclusiveStartKey)
+  return items
+}
+
+export const handler = async (event = {}) => {
+  const checkHour = toCheckHour(event.checkHour ?? DEFAULT_CHECK_HOUR)   // "07"
+  const subs = await loadDueSubscriptions(checkHour)   // only what's due
+  const groups = groupSorted(subs)                      // 50 people in Calgary → 1 forecast call
+  const stats = { checkHour, subscriptions: subs.length, locations: groups.length, sent: 0, not_triggered: 0, already_sent: 0, failed: 0 }
 
   for (let i = 0; i < groups.length; i += CONCURRENCY) {
     await Promise.all(groups.slice(i, i + CONCURRENCY).map(async (g) => {
@@ -266,9 +316,11 @@ export const handler = async () => {
 }
 ```
 
+> My first version used a full-table `Scan` here. A reader called it out, and they were right; see **"What I changed after community feedback"** below.
+
 Three production decisions in here:
 
-**1. Group by location.** Subscriptions are bucketed by latitude/longitude rounded to 2 decimals (~1 km). The number of weather API calls scales with *places*, not *people*.
+**1. Group by location, for free.** Because the GSI sort key starts with the rounded location, the Query returns each city's subscriptions next to each other. The number of weather API calls scales with *places*, not *people*, without any grouping work in memory.
 
 **2. Bounded concurrency.** 5 forecast calls at a time. Fast enough, and polite to a free API.
 
@@ -305,6 +357,34 @@ The order (publish, *then* record) is deliberate: if Lambda crashes between the 
 ## Step 6 — Infrastructure (SAM)
 
 The full `template.yaml` is in the repo. The interesting parts:
+
+### The index the daily job queries
+
+```yaml
+  SubscriptionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: id,        AttributeType: S }
+        - { AttributeName: email,     AttributeType: S }
+        - { AttributeName: checkHour, AttributeType: S }
+        - { AttributeName: locKey,    AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: ByCheckHour            # daily job: Query, not Scan
+          KeySchema:
+            - { AttributeName: checkHour, KeyType: HASH }
+            - { AttributeName: locKey,    KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: ByEmail                # signup: per-email cap
+          KeySchema:
+            - { AttributeName: email, KeyType: HASH }
+          Projection: { ProjectionType: KEYS_ONLY }
+```
+
+`ProjectionType: ALL` because the job needs the whole subscription (location, rule, `lastAlertDate`). `ByEmail` only counts, so `KEYS_ONLY` keeps it small.
 
 ### The schedule, in local time
 
@@ -474,13 +554,13 @@ aws lambda invoke --function-name <CheckFunctionName> response.json && cat respo
 ```
 
 ```json
-{"subscriptions":1,"locations":1,"sent":1,"not_triggered":0,"already_sent":0,"failed":0}
+{"checkHour":"07","subscriptions":1,"locations":1,"sent":1,"not_triggered":0,"already_sent":0,"failed":0}
 ```
 
 You should get the alert email within a minute. **Run the same command again:**
 
 ```json
-{"subscriptions":1,"locations":1,"sent":0,"not_triggered":0,"already_sent":1,"failed":0}
+{"checkHour":"07","subscriptions":1,"locations":1,"sent":0,"not_triggered":0,"already_sent":1,"failed":0}
 ```
 
 That's idempotency working: no duplicate email.
@@ -516,6 +596,85 @@ sam logs --stack-name weather-alerts --name CheckFunction --tail
 
 ---
 
+## What I changed after community feedback
+
+I shared a first draft in the contest Slack. The first comment was blunt and correct: *never like seeing a DynamoDB Scan; it looks simple to avoid here, with a GSI and/or secondary records written in a transaction.*
+
+### Why the Scan was wrong
+
+My v1 daily job did `Scan` → group in memory → check. A Scan reads **every item, every day**:
+
+- **Cost grows with the table, not with the work.** It reads people who unsubscribed months ago and alerts due at other times.
+- **It's slow at scale.** It reads at most 1 MB per page, one page after another.
+- **It doesn't use the shape of the data.** I was sorting into cities in memory, work the database could have done.
+
+In v1's "limits" section I'd written "Scan is fine to tens of thousands of rows". That was me defending a shortcut, not a design.
+
+### The two options
+
+| Option | How it works | Why I did / didn't pick it |
+|---|---|---|
+| **GSI `ByCheckHour`** ✅ | Each subscription gets `checkHour` + `locKey`; DynamoDB maintains the index | No extra writes in my code, nothing to keep in sync. The Query returns items already grouped by location. |
+| Secondary "location" records + `TransactWriteItems` | Write `LOC#<cell>` / `SUB#<id>` items in the same transaction as the subscription | Also correct, but every create, update and delete must keep two records in sync, and transactions cost 2× per write. |
+
+The GSI also fixes another v1 limit: with `checkHour` as the partition key, switching the schedule to hourly and letting people choose their own hour is now a change to the signup API, not a redesign.
+
+### Real snag #3: CloudFormation finished before the index did
+
+I deployed the GSI and the new Query code together. `sam deploy` printed `UPDATE_COMPLETE` in 55 seconds. Then I invoked the job right away:
+
+```
+ValidationException: Cannot read from backfilling global secondary index: ByCheckHour
+```
+
+```bash
+aws dynamodb describe-table --table-name <SubscriptionsTableName> \
+  --query "Table.GlobalSecondaryIndexes[].[IndexName,IndexStatus]"
+```
+
+```
+ByEmail      ACTIVE
+ByCheckHour  CREATING
+```
+
+**CloudFormation reports success when the GSI is *created*, not when it's *readable*.** DynamoDB keeps filling ("backfilling") the index in the background, and Queries fail until it's `ACTIVE`. If the 7 a.m. schedule had fired in that window, the run would have failed. The two retry layers from Step 6 would probably have covered it, but "probably" isn't a plan.
+
+**The safe way to add a GSI to a live table is two deploys:**
+
+1. Deploy the template with the new GSI, but keep the old code.
+2. Backfill the new attributes on existing items, and wait until the index is `ACTIVE`.
+3. Deploy the code that queries it.
+
+### Backfilling existing rows
+
+Items written before the change don't have `checkHour` / `locKey`, so the index can't see them. I backfilled them once with a conditional update (safe to re-run, and it won't overwrite rows the new code already wrote):
+
+```python
+# one-off backfill (boto3)
+import boto3
+table = boto3.resource("dynamodb").Table("<SubscriptionsTableName>")
+scan_kwargs = {"ProjectionExpression": "id, latitude, longitude, checkHour"}
+while True:
+    page = table.scan(**scan_kwargs)
+    for it in page["Items"]:
+        if "checkHour" in it:
+            continue
+        lk = f"{float(it['latitude']):.2f},{float(it['longitude']):.2f}#{it['id']}"
+        table.update_item(
+            Key={"id": it["id"]},
+            UpdateExpression="SET checkHour = :h, locKey = :l",
+            ConditionExpression="attribute_not_exists(checkHour)",
+            ExpressionAttributeValues={":h": "07", ":l": lk},
+        )
+    if "LastEvaluatedKey" not in page:
+        break
+    scan_kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+```
+
+Yes, a migration is the one place a Scan is fine: it runs once, not every morning.
+
+---
+
 ## What it costs
 
 At hobby scale (say 100 subscribers, one run a day), everything here fits inside the AWS Free Tier or rounds to cents:
@@ -535,11 +694,11 @@ Check current prices on the [AWS pricing pages](https://aws.amazon.com/pricing/)
 
 ## Scaling and limits (honest version)
 
-- **Scan is fine to ~tens of thousands of rows** on a once-a-day job. Beyond that, add a GSI keyed on a location cell and fan out per location with SQS, so each location is processed by its own Lambda invocation.
-- **One Lambda run has a 15-minute ceiling.** Same fix: fan out via SQS.
+- **A single `checkHour` value is one GSI partition key.** At millions of subscribers due at the same hour, split it into shards (`07#0` … `07#9`) and Query each shard in parallel.
+- **One Lambda run has a 15-minute ceiling.** For very large runs, have the job enqueue one SQS message per location group and let a worker Lambda process each one.
 - **SNS email** is meant for notifications, not newsletters. For branded HTML emails or high volume, use Amazon SES with a verified domain.
 - **Unsubscribed users stay in DynamoDB.** SNS stops delivering to them (so they get nothing), but the daily job still evaluates them. A cleanup could check `GetSubscriptionAttributes` weekly and delete rows whose subscription is gone.
-- **Single daily timezone.** Everyone is checked at 7 a.m. in one timezone. Per-user times would mean bucketing subscriptions by hour and running the schedule hourly.
+- **One alert time for everyone (for now).** The GSI is already keyed by hour. Per-user times only need an `hour` field on signup and an hourly schedule that queries the current hour.
 
 ---
 
@@ -574,6 +733,8 @@ aws cloudformation describe-stacks --stack-name weather-alerts   # → "Stack ..
 2. **SNS filter policies turn one topic into per-user delivery**, and you get double opt-in and unsubscribe links without writing email code.
 3. **Async invocations have two retry layers.** Scheduler's retry policy doesn't catch errors thrown by your code; Lambda's `EventInvokeConfig` does.
 4. **Retries need idempotency.** A `lastAlertDate` field is all it took to make "retry the whole job" safe.
-5. **Keep decision logic pure.** `rules.mjs` has no AWS in it, so the part most likely to have bugs is tested in milliseconds without a deploy.
+5. **Design the table around the question you ask every day.** "Who's due now, grouped by city?" is a GSI Query, not a Scan. A reader spotted it in one sentence.
+6. **CloudFormation's "complete" isn't DynamoDB's "ready".** Add a GSI, wait for `ACTIVE`, *then* ship code that reads it.
+7. **Keep decision logic pure.** `rules.mjs` has no AWS in it, so the part most likely to have bugs is tested in milliseconds without a deploy.
 
 **Full code:** https://github.com/Rajpreet12/weather-alerts

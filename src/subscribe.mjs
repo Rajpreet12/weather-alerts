@@ -4,6 +4,7 @@ import { DynamoDBDocumentClient, PutCommand, QueryCommand } from '@aws-sdk/lib-d
 import { SNSClient, SubscribeCommand } from '@aws-sdk/client-sns'
 import { validateRule, RULES } from './rules.mjs'
 import { geocode } from './weather.mjs'
+import { DEFAULT_CHECK_HOUR, locKey } from './keys.mjs'
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}))
 const sns = new SNSClient({})
@@ -75,6 +76,9 @@ export const handler = async (event) => {
           id,
           email,
           ...place,
+          // Keys for the ByCheckHour GSI the daily job queries.
+          checkHour: DEFAULT_CHECK_HOUR,
+          locKey: locKey(place.latitude, place.longitude, id),
           rule: { type: rule.type, threshold: rule.threshold },
           snsSubscriptionArn: sub.SubscriptionArn,
           createdAt: new Date().toISOString(),

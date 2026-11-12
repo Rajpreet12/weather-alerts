@@ -1,34 +1,37 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
-import { DynamoDBDocumentClient, ScanCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb'
+import { DynamoDBDocumentClient, QueryCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb'
 import { SNSClient, PublishCommand } from '@aws-sdk/client-sns'
 import { evaluate, formatAlert } from './rules.mjs'
 import { getDailyForecast } from './weather.mjs'
+import { DEFAULT_CHECK_HOUR, groupSorted, toCheckHour } from './keys.mjs'
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}))
 const sns = new SNSClient({})
 const { TABLE_NAME, TOPIC_ARN } = process.env
 const CONCURRENCY = 5
 
-async function loadSubscriptions() {
+/**
+ * Reads only the subscriptions due at this hour, via the ByCheckHour GSI.
+ * (v1 used a full-table Scan here — see "What I changed after feedback".)
+ * Results come back sorted by locKey, i.e. already grouped by location.
+ */
+async function loadDueSubscriptions(checkHour) {
   const items = []
   let ExclusiveStartKey
   do {
-    const page = await ddb.send(new ScanCommand({ TableName: TABLE_NAME, ExclusiveStartKey }))
+    const page = await ddb.send(
+      new QueryCommand({
+        TableName: TABLE_NAME,
+        IndexName: 'ByCheckHour',
+        KeyConditionExpression: 'checkHour = :h',
+        ExpressionAttributeValues: { ':h': checkHour },
+        ExclusiveStartKey,
+      }),
+    )
     items.push(...(page.Items ?? []))
     ExclusiveStartKey = page.LastEvaluatedKey
   } while (ExclusiveStartKey)
   return items
-}
-
-/** Many people in one city → one forecast call. Round to ~1 km so nearby points share too. */
-function groupByLocation(subs) {
-  const groups = new Map()
-  for (const s of subs) {
-    const key = `${s.latitude.toFixed(2)},${s.longitude.toFixed(2)}`
-    if (!groups.has(key)) groups.set(key, { latitude: s.latitude, longitude: s.longitude, subs: [] })
-    groups.get(key).subs.push(s)
-  }
-  return [...groups.values()]
 }
 
 async function alertOne(sub, daily) {
@@ -59,10 +62,12 @@ async function alertOne(sub, daily) {
   return 'sent'
 }
 
-export const handler = async () => {
-  const subs = await loadSubscriptions()
-  const groups = groupByLocation(subs)
-  const stats = { subscriptions: subs.length, locations: groups.length, sent: 0, not_triggered: 0, already_sent: 0, failed: 0 }
+export const handler = async (event = {}) => {
+  // The schedule runs at 7 a.m.; a manual invoke can pass {"checkHour":"07"} or any other hour.
+  const checkHour = toCheckHour(event.checkHour ?? DEFAULT_CHECK_HOUR)
+  const subs = await loadDueSubscriptions(checkHour)
+  const groups = groupSorted(subs)
+  const stats = { checkHour, subscriptions: subs.length, locations: groups.length, sent: 0, not_triggered: 0, already_sent: 0, failed: 0 }
 
   // Small fixed concurrency: fast enough, and polite to a free weather API.
   for (let i = 0; i < groups.length; i += CONCURRENCY) {

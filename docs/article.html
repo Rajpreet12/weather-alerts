@@ -150,7 +150,7 @@
 <!-- ======================= INTRO ======================= -->
 <p class="lede">Weather apps tell you <em>everything, every day</em>. A daily forecast notification trains you to swipe it away, so on the one morning it says "−25°C tonight" or "70% chance of rain", you've already stopped reading.</p>
 <p>I wanted the opposite: <strong>silence, unless something I care about is about to happen.</strong> You set a rule like "rain chance ≥ 60%" or "low ≤ −10°C" and get an email at 7 a.m. <em>only on the days that rule is crossed</em>. Every other day, nothing.</p>
-<p>This tutorial builds that, end to end, as a small serverless app you can deploy into your own AWS account in about half an hour. I deployed it, tested it with a real inbox, and hit two real problems along the way. Both are written up below.</p>
+<p>This tutorial builds that, end to end, as a small serverless app you can deploy into your own AWS account in about half an hour. I deployed it, tested it with a real inbox, hit three real problems, and <strong>redesigned part of it after community feedback</strong>. All of that is written up below.</p>
 
 <div class="tldr">
   <h3>What you'll walk away with</h3>
@@ -205,7 +205,7 @@
     <g filter="url(#sh)"><rect x="300" y="158" width="160" height="46" rx="12" fill="#fff" stroke="#3b82f6"/></g>
     <rect x="300" y="158" width="8" height="46" rx="4" fill="#3b82f6"/>
     <text x="384" y="178" text-anchor="middle" font-size="12" font-weight="700" fill="#0f172a">DynamoDB</text>
-    <text x="384" y="194" text-anchor="middle" font-size="9.5" fill="#64748b">Subscriptions + GSI ByEmail</text>
+    <text x="384" y="194" text-anchor="middle" font-size="9.5" fill="#64748b">GSIs: ByEmail · ByCheckHour</text>
 
     <!-- sns topic -->
     <g filter="url(#sh)"><rect x="560" y="150" width="170" height="70" rx="12" fill="#fff" stroke="#f43f5e"/></g>
@@ -265,7 +265,7 @@
     <g font-size="9" fill="#475569">
       <text x="494" y="134">sns:Subscribe</text>
       <text x="418" y="148">put</text>
-      <text x="356" y="236">scan</text>
+      <text x="300" y="236" font-weight="700" fill="#047857">Query ByCheckHour</text>
       <text x="500" y="250">publish + subscriptionId</text>
       <text x="672" y="262">email</text>
     </g>
@@ -279,7 +279,7 @@
   <tr><td><strong>EventBridge Scheduler</strong><br><span style="color:#64748b;font-size:8.6pt">not a scheduled EventBridge <em>rule</em></span></td><td>Understands <strong>timezones</strong>, so 7 a.m. stays 7 a.m. across daylight saving (rules are UTC-only). Has its own retry policy and dead-letter queue.</td><td>Nothing meaningful. It's the newer, recommended option.</td></tr>
   <tr><td><strong>SNS email + filter policies</strong><br><span style="color:#64748b;font-size:8.6pt">not SES</span></td><td>SNS sends the confirmation email and adds an <strong>unsubscribe link</strong>. No domain verification and no "SES sandbox" exit request.</td><td>Plain text only, generic sender name, not built for high volume. For a branded product, move to SES.</td></tr>
   <tr><td><strong>Open-Meteo</strong></td><td>Free, <strong>no API key</strong>, so no secret to manage. Geocoding included.</td><td>Non-commercial use, and you must credit them (the email footer does).</td></tr>
-  <tr><td><strong>DynamoDB on-demand</strong></td><td>Pay per request; costs nothing while idle.</td><td>A daily full-table <code>Scan</code> is fine for thousands of rows, not millions.</td></tr>
+  <tr><td><strong>DynamoDB on-demand + a GSI</strong></td><td>Pay per request; costs nothing while idle. A GSI lets the job <code>Query</code> only what's due, already grouped by city.</td><td>Every write also updates the index. At millions of rows, one <code>checkHour</code> needs sharding.</td></tr>
   <tr><td><strong>Lambda on arm64</strong></td><td>Graviton costs about 20% less per GB-second, and this code has no native dependencies.</td><td>None for pure JavaScript.</td></tr>
 </table>
 
@@ -292,8 +292,8 @@ aws sts get-caller-identity     <span class="c"># shows the account you're about
 cd weather-alerts
 npm test</code></pre>
 <div class="grid2">
-  <div class="card"><h4>📁 What's inside</h4><p><code>template.yaml</code>: all the infrastructure<br><code>src/rules.mjs</code>: alert logic, no AWS<br><code>src/weather.mjs</code>: Open-Meteo calls<br><code>src/subscribe.mjs</code>: the signup API<br><code>src/check.mjs</code>: the daily job<br><code>test/rules.test.mjs</code>: unit tests</p></div>
-  <div class="card"><h4>📦 No <code>npm install</code></h4><p>The Node.js 24 Lambda runtime already includes the AWS SDK v3 and a global <code>fetch</code>, so the deployment package is just four source files. There are no dependencies to keep patched and nothing to bundle.</p></div>
+  <div class="card"><h4>📁 What's inside</h4><p><code>template.yaml</code>: all the infrastructure<br><code>src/rules.mjs</code>: alert logic, no AWS<br><code>src/weather.mjs</code>: Open-Meteo calls<br><code>src/subscribe.mjs</code>: the signup API<br><code>src/check.mjs</code>: the daily job<br><code>src/keys.mjs</code>: GSI key helpers<br><code>test/</code>: 10 unit tests</p></div>
+  <div class="card"><h4>📦 No <code>npm install</code></h4><p>The Node.js 24 Lambda runtime already includes the AWS SDK v3 and a global <code>fetch</code>, so the deployment package is just five source files. There are no dependencies to keep patched and nothing to bundle.</p></div>
 </div>
 
 <!-- ======================= STEP 2 ======================= -->
@@ -324,7 +324,11 @@ npm test</code></pre>
 <span class="ok">✔</span> missing forecast data never alerts
 <span class="ok">✔</span> validateRule rejects bad input
 <span class="ok">✔</span> formatAlert subject stays under the SNS 100-char limit
-<span class="dim">ℹ</span> pass <span class="ok">6</span>   <span class="dim">ℹ</span> fail <span class="ok">0</span></pre></div>
+<span class="ok">✔</span> toCheckHour normalises to two digits and rejects bad hours
+<span class="ok">✔</span> locKey rounds to ~1 km and appends the id
+<span class="ok">✔</span> groupSorted groups adjacent items from a GSI-sorted Query
+<span class="ok">✔</span> groupSorted handles an empty result
+<span class="dim">ℹ</span> pass <span class="ok">10</span>   <span class="dim">ℹ</span> fail <span class="ok">0</span></pre></div>
 
 <div class="callout bug"><b class="t">Real snag #1</b>My first <code>package.json</code> used <code>"test": "node --test test/"</code>. On Windows that found <strong>zero</strong> tests and reported a failure. Plain <code>node --test</code> auto-discovers <code>*.test.mjs</code> files on every OS.</div>
 
@@ -410,6 +414,8 @@ npm test</code></pre>
 <span class="k">await</span> ddb.<span class="f">send</span>(<span class="k">new</span> PutCommand({
   TableName: TABLE_NAME,
   Item: { id, email, ...place, rule: { type: rule.type, threshold: rule.threshold },
+          <span class="c">// keys for the ByCheckHour GSI the daily job queries (Step 5)</span>
+          checkHour: <span class="s">'07'</span>, locKey: <span class="f">locKey</span>(place.latitude, place.longitude, id),
           snsSubscriptionArn: sub.SubscriptionArn, createdAt: <span class="k">new</span> Date().<span class="f">toISOString</span>() },
 }))</code></pre>
 
@@ -437,11 +443,33 @@ npm test</code></pre>
 
 <!-- ======================= STEP 5 ======================= -->
 <h2><span class="step">STEP 5</span>The daily job: fast, polite and retry-safe</h2>
+<p>The job must <strong>not</strong> read the whole table every morning. Every subscription carries two extra attributes that feed a <strong>global secondary index</strong>:</p>
+<table>
+  <tr><th>GSI <code style="background:#1e293b;color:#fde68a">ByCheckHour</code></th><th>Example</th><th>Answers</th></tr>
+  <tr><td>Partition key <code>checkHour</code></td><td><code>"07"</code></td><td>Which subscriptions are due at this hour?</td></tr>
+  <tr><td>Sort key <code>locKey</code></td><td><code>"51.05,-114.09#b780…"</code></td><td>Sorted by location (~1 km), then id</td></tr>
+</table>
 <pre><code><span class="c">// src/check.mjs (core)</span>
-<span class="k">export const</span> handler = <span class="k">async</span> () =&gt; {
-  <span class="k">const</span> subs = <span class="k">await</span> <span class="f">loadSubscriptions</span>()        <span class="c">// paginated Scan</span>
-  <span class="k">const</span> groups = <span class="f">groupByLocation</span>(subs)          <span class="c">// 50 people in Calgary → 1 forecast call</span>
-  <span class="k">const</span> stats = { subscriptions: subs.length, locations: groups.length, sent: <span class="n">0</span>, ... }
+<span class="k">async function</span> <span class="f">loadDueSubscriptions</span>(checkHour) {
+  <span class="k">const</span> items = []
+  <span class="k">let</span> ExclusiveStartKey
+  <span class="k">do</span> {
+    <span class="k">const</span> page = <span class="k">await</span> ddb.<span class="f">send</span>(<span class="k">new</span> QueryCommand({
+      TableName: TABLE_NAME, IndexName: <span class="s">'ByCheckHour'</span>,
+      KeyConditionExpression: <span class="s">'checkHour = :h'</span>, ExpressionAttributeValues: { <span class="s">':h'</span>: checkHour },
+      ExclusiveStartKey,
+    }))
+    items.<span class="f">push</span>(...(page.Items ?? []))
+    ExclusiveStartKey = page.LastEvaluatedKey
+  } <span class="k">while</span> (ExclusiveStartKey)
+  <span class="k">return</span> items
+}
+
+<span class="k">export const</span> handler = <span class="k">async</span> (event = {}) =&gt; {
+  <span class="k">const</span> checkHour = <span class="f">toCheckHour</span>(event.checkHour ?? DEFAULT_CHECK_HOUR)   <span class="c">// "07"</span>
+  <span class="k">const</span> subs = <span class="k">await</span> <span class="f">loadDueSubscriptions</span>(checkHour)   <span class="c">// only what's due</span>
+  <span class="k">const</span> groups = <span class="f">groupSorted</span>(subs)                      <span class="c">// already sorted by city → one pass</span>
+  <span class="k">const</span> stats = { checkHour, subscriptions: subs.length, locations: groups.length, sent: <span class="n">0</span>, ... }
 
   <span class="k">for</span> (<span class="k">let</span> i = <span class="n">0</span>; i &lt; groups.length; i += CONCURRENCY) {      <span class="c">// 5 at a time</span>
     <span class="k">await</span> Promise.<span class="f">all</span>(groups.<span class="f">slice</span>(i, i + CONCURRENCY).<span class="f">map</span>(<span class="k">async</span> (g) =&gt; {
@@ -456,6 +484,18 @@ npm test</code></pre>
   <span class="k">if</span> (stats.failed &gt; <span class="n">0</span>) <span class="k">throw new</span> Error(<span class="s">`${stats.failed} alert(s) failed`</span>)   <span class="c">// → Lambda retries</span>
   <span class="k">return</span> stats
 }</code></pre>
+<pre><code><span class="c">// src/keys.mjs: items arrive sorted by locKey, so same-city items are adjacent</span>
+<span class="k">export function</span> <span class="f">groupSorted</span>(subs) {
+  <span class="k">const</span> groups = []
+  <span class="k">for</span> (<span class="k">const</span> s <span class="k">of</span> subs) {
+    <span class="k">const</span> cell = s.locKey.<span class="f">slice</span>(<span class="n">0</span>, s.locKey.<span class="f">indexOf</span>(<span class="s">'#'</span>))
+    <span class="k">const</span> last = groups[groups.length - <span class="n">1</span>]
+    <span class="k">if</span> (last &amp;&amp; last.cell === cell) last.subs.<span class="f">push</span>(s)
+    <span class="k">else</span> groups.<span class="f">push</span>({ cell, latitude: s.latitude, longitude: s.longitude, subs: [s] })
+  }
+  <span class="k">return</span> groups
+}</code></pre>
+<div class="callout info"><b class="t">v1 used a Scan here</b>A reader called it out in one sentence, and they were right. See <strong>"What I changed after community feedback"</strong> below.</div>
 
 <h3>Idempotency: why retries don't double-email anyone</h3>
 <pre><code><span class="k">async function</span> <span class="f">alertOne</span>(sub, daily) {
@@ -495,6 +535,25 @@ npm test</code></pre>
 <!-- ======================= STEP 6 ======================= -->
 <h2><span class="step">STEP 6</span>The infrastructure in one SAM template</h2>
 <p>The full <code>template.yaml</code> is in the repo. These are the parts worth understanding:</p>
+<pre><code><span class="f">SubscriptionsTable</span>:
+  Type: AWS::DynamoDB::Table
+  Properties:
+    BillingMode: PAY_PER_REQUEST
+    AttributeDefinitions:
+      - { AttributeName: id, AttributeType: S }
+      - { AttributeName: email, AttributeType: S }
+      - { AttributeName: checkHour, AttributeType: S }
+      - { AttributeName: locKey, AttributeType: S }
+    KeySchema: [{ AttributeName: id, KeyType: HASH }]
+    GlobalSecondaryIndexes:
+      - IndexName: ByCheckHour                 <span class="c"># daily job: Query, not Scan</span>
+        KeySchema:
+          - { AttributeName: checkHour, KeyType: HASH }
+          - { AttributeName: locKey, KeyType: RANGE }
+        Projection: { ProjectionType: ALL }    <span class="c"># job needs the whole item</span>
+      - IndexName: ByEmail                     <span class="c"># signup: per-email cap</span>
+        KeySchema: [{ AttributeName: email, KeyType: HASH }]
+        Projection: { ProjectionType: KEYS_ONLY }   <span class="c"># only counts, keep it small</span></code></pre>
 <pre><code><span class="f">CheckFunction</span>:
   Type: AWS::Serverless::Function
   Properties:
@@ -579,10 +638,10 @@ sam deploy --guided            <span class="c"># pick your own ScheduleTimezone,
 <h3>③ Run the morning job now instead of waiting until 7 a.m.</h3>
 <div class="term"><div class="bar"><i style="background:#f87171"></i><i style="background:#fbbf24"></i><i style="background:#4ade80"></i><span>real output, run twice</span></div>
 <pre><span class="dim">$</span> aws lambda invoke --function-name &lt;CheckFunctionName&gt; response.json &amp;&amp; cat response.json
-{"subscriptions":1,"locations":1,<span class="ok">"sent":1</span>,"not_triggered":0,"already_sent":0,"failed":0}
+{"checkHour":"07","subscriptions":1,"locations":1,<span class="ok">"sent":1</span>,"not_triggered":0,"already_sent":0,"failed":0}
 
 <span class="dim">$</span> aws lambda invoke --function-name &lt;CheckFunctionName&gt; response.json &amp;&amp; cat response.json
-{"subscriptions":1,"locations":1,<span class="hi">"sent":0</span>,"not_triggered":0,<span class="hi">"already_sent":1</span>,"failed":0}   <span class="dim">← no duplicate</span></pre></div>
+{"checkHour":"07","subscriptions":1,"locations":1,<span class="hi">"sent":0</span>,"not_triggered":0,<span class="hi">"already_sent":1</span>,"failed":0}   <span class="dim">← no duplicate</span></pre></div>
 
 <p>Within a minute, the alert arrives. This is what the message looks like, generated by <code>formatAlert()</code> from that day's real Calgary forecast:</p>
 <div class="email">
@@ -610,6 +669,53 @@ empty table   {"subscriptions":0,"locations":0,"sent":0,...,"failed":0}         
 <p>The per-email cap defaults to 3 (<code>MaxAlertsPerEmail</code>). With one alert already set up, two more subscribe calls succeed and the next returns <code>429</code>. Logs: <code>sam logs --stack-name weather-alerts --name CheckFunction --tail</code>.</p>
 
 <!-- ======================= COST ======================= -->
+<h2>💬 What I changed after community feedback</h2>
+<p>I shared a first draft in the contest Slack. The first comment was blunt and correct:</p>
+<div class="callout info" style="font-style:italic">"Never like seeing a DynamoDB Scan; it looks simple to avoid in this use case (GSI and/or secondary records with a transacted write)."</div>
+<p>My v1 daily job did <code>Scan</code> → group in memory → check. A Scan reads <strong>every item, every day</strong>: the cost grows with the table, not the work (unsubscribed rows included), it reads at most 1 MB per page, one page after another, and I was sorting into cities in memory when the database could do it. In v1 I'd written "Scan is fine to tens of thousands of rows". That was me defending a shortcut, not a design.</p>
+
+<figure>
+  <svg viewBox="0 0 760 200" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, sans-serif">
+    <rect width="760" height="200" rx="16" fill="#f8fafc"/>
+    <text x="190" y="30" text-anchor="middle" font-size="12" font-weight="800" fill="#be123c">v1 · Scan</text>
+    <text x="570" y="30" text-anchor="middle" font-size="12" font-weight="800" fill="#047857">v2 · Query ByCheckHour = "07"</text>
+    <line x1="380" y1="16" x2="380" y2="186" stroke="#e2e8f0" stroke-dasharray="5 5"/>
+    <g font-size="9.5">
+      <rect x="40" y="44" width="300" height="20" rx="5" fill="#fee2e2"/><text x="50" y="58" fill="#9f1239">read: Calgary · 07 · active</text>
+      <rect x="40" y="68" width="300" height="20" rx="5" fill="#fee2e2"/><text x="50" y="82" fill="#9f1239">read: Paris · 07 · unsubscribed months ago</text>
+      <rect x="40" y="92" width="300" height="20" rx="5" fill="#fee2e2"/><text x="50" y="106" fill="#9f1239">read: Toronto · 07 · active</text>
+      <rect x="40" y="116" width="300" height="20" rx="5" fill="#fee2e2"/><text x="50" y="130" fill="#9f1239">read: Calgary · 07 · active</text>
+      <rect x="40" y="140" width="300" height="20" rx="5" fill="#fee2e2"/><text x="50" y="154" fill="#9f1239">read: … every row, every morning</text>
+      <text x="190" y="180" text-anchor="middle" fill="#9f1239" font-weight="700">then group by city in memory</text>
+      <rect x="420" y="44" width="300" height="20" rx="5" fill="#dcfce7"/><text x="430" y="58" fill="#065f46">07 │ 43.70,-79.42#… Toronto</text>
+      <rect x="420" y="68" width="300" height="20" rx="5" fill="#dcfce7"/><text x="430" y="82" fill="#065f46">07 │ 51.05,-114.09#… Calgary</text>
+      <rect x="420" y="92" width="300" height="20" rx="5" fill="#dcfce7"/><text x="430" y="106" fill="#065f46">07 │ 51.05,-114.09#… Calgary</text>
+      <rect x="420" y="116" width="300" height="20" rx="5" fill="#f1f5f9"/><text x="430" y="130" fill="#94a3b8">08 │ … not read (different hour)</text>
+      <rect x="420" y="140" width="300" height="20" rx="5" fill="#f1f5f9"/><text x="430" y="154" fill="#94a3b8">19 │ … not read</text>
+      <text x="570" y="180" text-anchor="middle" fill="#047857" font-weight="700">only what's due, already grouped by city</text>
+    </g>
+  </svg>
+  <figcaption>Figure 6. Same question, two access patterns. The sort key does the grouping for free.</figcaption>
+</figure>
+
+<table>
+  <tr><th style="width:28%">Option</th><th style="width:36%">How</th><th>Why I did / didn't pick it</th></tr>
+  <tr><td><strong>GSI <code>ByCheckHour</code></strong> ✅</td><td>Each subscription gets <code>checkHour</code> + <code>locKey</code>; DynamoDB maintains the index.</td><td>No extra writes in my code, nothing to keep in sync, and the Query returns items already grouped by location.</td></tr>
+  <tr><td>Secondary location records + <code>TransactWriteItems</code></td><td>Write <code>LOC#&lt;cell&gt;</code> / <code>SUB#&lt;id&gt;</code> items in the same transaction as the subscription.</td><td>Also correct, but every create, update and delete must keep two records in sync, and transactions cost 2× per write.</td></tr>
+</table>
+<p>Bonus: with <code>checkHour</code> as the partition key, letting people choose their own alert hour is now a small change to the signup API plus an hourly schedule, not a redesign.</p>
+
+<div class="callout bug"><b class="t">Real snag #3: CloudFormation finished before the index did</b>I deployed the GSI and the new Query code together. <code>sam deploy</code> printed <code>UPDATE_COMPLETE</code> in 55 seconds. I invoked the job right away and got:<br><code>ValidationException: Cannot read from backfilling global secondary index: ByCheckHour</code><br><strong>CloudFormation reports success when a GSI is <em>created</em>, not when it's <em>readable</em>.</strong> DynamoDB keeps filling ("backfilling") the index in the background, and Queries fail until it's <code>ACTIVE</code>.</div>
+<div class="term"><div class="bar"><i style="background:#f87171"></i><i style="background:#fbbf24"></i><i style="background:#4ade80"></i><span>right after UPDATE_COMPLETE</span></div>
+<pre><span class="dim">$</span> aws dynamodb describe-table --table-name &lt;SubscriptionsTableName&gt; \
+    --query "Table.GlobalSecondaryIndexes[].[IndexName,IndexStatus]"
+ByEmail      <span class="ok">ACTIVE</span>
+ByCheckHour  <span class="err">CREATING</span>     <span class="dim">← CloudFormation already said "complete"</span></pre></div>
+<div class="grid2">
+  <div class="card"><h4>🚦 Add a GSI to a live table in two deploys</h4><p>1. Deploy the GSI, but keep the old code.<br>2. Backfill existing rows, then wait for <code>ACTIVE</code>.<br>3. Deploy the code that queries it.</p></div>
+  <div class="card"><h4>🔁 Backfill old rows once</h4><p>Rows written before the change lack <code>checkHour</code>/<code>locKey</code>, so the index can't see them. I set them with a <strong>conditional</strong> update (<code>attribute_not_exists(checkHour)</code>), which is safe to re-run. A one-time migration is the one place a Scan is fine.</p></div>
+</div>
+
 <h2>💸 What it costs</h2>
 <p>At hobby scale (around 100 subscribers, one run a day), everything fits in the AWS Free Tier or rounds to cents:</p>
 <table>
@@ -625,10 +731,10 @@ empty table   {"subscriptions":0,"locations":0,"sent":0,...,"failed":0}         
 
 <h2>📈 Scaling and limits (the honest version)</h2>
 <div class="grid2">
-  <div class="card"><h4>Scan is fine… for now</h4><p>A once-a-day <code>Scan</code> handles tens of thousands of rows. Beyond that, fan out per location through SQS so each city gets its own Lambda invocation. That also gets around Lambda's 15-minute limit.</p></div>
+  <div class="card"><h4>Hot partition at huge scale</h4><p>All 7 a.m. subscriptions share one GSI partition key. At millions, split it into shards (<code>07#0</code> … <code>07#9</code>) and Query them in parallel; enqueue location groups to SQS to stay under Lambda's 15-minute limit.</p></div>
   <div class="card"><h4>SNS email isn't a newsletter</h4><p>It's built for notifications. For branded HTML emails or high volume, switch to Amazon SES with a verified domain.</p></div>
   <div class="card"><h4>Unsubscribed rows linger</h4><p>SNS stops delivering to people who unsubscribe, but the job still evaluates their rows. A weekly cleanup could check <code>GetSubscriptionAttributes</code> and delete the dead ones.</p></div>
-  <div class="card"><h4>One timezone for everyone</h4><p>Everyone is checked at 7 a.m. in one timezone. For per-user times, bucket subscriptions by hour and run the schedule hourly.</p></div>
+  <div class="card"><h4>One alert time (for now)</h4><p>The GSI is already keyed by hour. Per-user times just need an <code>hour</code> field on signup and an hourly schedule that queries the current hour.</p></div>
 </div>
 
 <h2>🧹 Clean up</h2>
@@ -648,6 +754,8 @@ aws cloudformation describe-stacks --stack-name weather-alerts   <span class="c"
   <li><strong>SNS filter policies turn one topic into per-user delivery</strong>, and you get double opt-in and unsubscribe links without writing email code.</li>
   <li><strong>Asynchronous invocations have two retry layers.</strong> Scheduler's retry policy won't catch errors thrown by your own code; Lambda's <code>EventInvokeConfig</code> will.</li>
   <li><strong>Retries need idempotency.</strong> One <code>lastAlertDate</code> field made "retry the whole job" safe.</li>
+  <li><strong>Design the table around the question you ask every day.</strong> "Who's due now, grouped by city?" is a GSI Query, not a Scan. A reader spotted it in one sentence.</li>
+  <li><strong>CloudFormation's "complete" isn't DynamoDB's "ready".</strong> Add a GSI, wait for <code>ACTIVE</code>, <em>then</em> ship the code that reads it.</li>
   <li><strong>Check what your framework named things.</strong> A default name with no stack prefix works fine until the day you deploy a second copy.</li>
 </ol>
 
