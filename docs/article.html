@@ -635,8 +635,9 @@ empty table   {"subscriptions":0,"locations":0,"sent":0,...,"failed":0}         
 <pre><code>sam delete --stack-name weather-alerts</code></pre>
 <p>This removes the API, both Lambdas, the table, the SNS topic (and with it every email subscription), the schedule and both SQS queues. <strong>Nothing is left running or billing.</strong></p>
 <div class="callout warn"><b class="t">Don't forget the logs</b><code>sam delete</code> does <strong>not</strong> remove the CloudWatch log groups, because Lambda creates them on first run, outside the stack. Delete them too:</div>
-<pre><code>aws logs describe-log-groups --log-group-name-prefix /aws/lambda/weather-alerts-   --query "logGroups[].logGroupName" --output text | tr '	' '
-' |   xargs -I{} aws logs delete-log-group --log-group-name {}
+<pre><code>aws logs describe-log-groups --log-group-name-prefix /aws/lambda/weather-alerts- \
+  --query "logGroups[].logGroupName" --output text | tr '\t' '\n' | \
+  xargs -I{} aws logs delete-log-group --log-group-name {}
 
 aws cloudformation describe-stacks --stack-name weather-alerts   <span class="c"># → "Stack ... does not exist"</span></code></pre>
 

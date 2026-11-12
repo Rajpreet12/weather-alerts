@@ -554,8 +554,9 @@ This removes the API, both Lambdas, the table, the SNS topic (and therefore all 
 `sam delete` does **not** remove the CloudWatch log groups, because Lambda creates them on first run, outside the stack. Delete them too, or they'll sit in your account (tiny, but not "clean"):
 
 ```bash
-aws logs describe-log-groups --log-group-name-prefix /aws/lambda/weather-alerts-   --query "logGroups[].logGroupName" --output text | tr '	' '
-' |   xargs -I{} aws logs delete-log-group --log-group-name {}
+aws logs describe-log-groups --log-group-name-prefix /aws/lambda/weather-alerts- \
+  --query "logGroups[].logGroupName" --output text | tr '\t' '\n' | \
+  xargs -I{} aws logs delete-log-group --log-group-name {}
 ```
 
 Finally, confirm nothing is left:
