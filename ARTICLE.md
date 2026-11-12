@@ -1,4 +1,4 @@
-# Build Serverless Weather Alerts with EventBridge Scheduler, Lambda, DynamoDB and SNS
+# Silence Is a Feature: Build Serverless Weather Alerts with EventBridge Scheduler, Lambda, DynamoDB and SNS
 
 *Get an email at 7 a.m. only on the days it matters — "rain chance ≥ 60%", "low ≤ −10°C", "wind ≥ 50 km/h". One SAM template, three AWS services doing the heavy lifting, no servers, no API keys, and about $0 a month at hobby scale.*
 
@@ -55,6 +55,13 @@ By the end of this tutorial you'll have:
 ---
 
 ## Step 1 — Get the code
+
+Make sure the CLI is signed in to the account you want to deploy into:
+
+```bash
+aws login                       # or: aws configure
+aws sts get-caller-identity     # shows the account you're about to deploy to
+```
 
 ```bash
 git clone https://github.com/Rajpreet12/weather-alerts weather-alerts
@@ -542,7 +549,21 @@ Check current prices on the [AWS pricing pages](https://aws.amazon.com/pricing/)
 sam delete --stack-name weather-alerts
 ```
 
-This removes the API, both Lambdas, the table, the SNS topic (and therefore all email subscriptions), the schedule and both SQS queues. Nothing is left running or billing. Delete the `response.json` file from Step 8 if you like.
+This removes the API, both Lambdas, the table, the SNS topic (and therefore all email subscriptions), the schedule and both SQS queues.
+
+`sam delete` does **not** remove the CloudWatch log groups, because Lambda creates them on first run, outside the stack. Delete them too, or they'll sit in your account (tiny, but not "clean"):
+
+```bash
+aws logs describe-log-groups --log-group-name-prefix /aws/lambda/weather-alerts-   --query "logGroups[].logGroupName" --output text | tr '	' '
+' |   xargs -I{} aws logs delete-log-group --log-group-name {}
+```
+
+Finally, confirm nothing is left:
+
+```bash
+aws cloudformation describe-stacks --stack-name weather-alerts   # → "Stack ... does not exist"
+```
+
 
 ---
 
