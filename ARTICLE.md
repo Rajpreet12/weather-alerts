@@ -2,7 +2,7 @@
 
 *Get an email at 7 a.m. only on the days it matters — "rain chance ≥ 60%", "low ≤ −10°C", "wind ≥ 50 km/h". One SAM template, three AWS services doing the heavy lifting, no servers, no API keys, and about $0 a month at hobby scale.*
 
-**Repo:** `https://github.com/Rajpreet12/weather-alerts`
+**Repo:** https://github.com/Rajpreet12/weather-alerts
 **Time:** ~30 minutes · **You'll need:** an AWS account, AWS CLI v2, AWS SAM CLI, Node.js 20+
 
 ---
@@ -554,4 +554,4 @@ This removes the API, both Lambdas, the table, the SNS topic (and therefore all 
 4. **Retries need idempotency.** A `lastAlertDate` field is all it took to make "retry the whole job" safe.
 5. **Keep decision logic pure.** `rules.mjs` has no AWS in it, so the part most likely to have bugs is tested in milliseconds without a deploy.
 
-**Full code:** `https://github.com/Rajpreet12/weather-alerts`
+**Full code:** https://github.com/Rajpreet12/weather-alerts
