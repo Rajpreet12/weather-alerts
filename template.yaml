@@ -1,0 +1,139 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless weather alerts — EventBridge Scheduler + Lambda + DynamoDB + SNS email
+
+Parameters:
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 7 * * ? *)
+    Description: When the daily check runs (EventBridge Scheduler syntax)
+  ScheduleTimezone:
+    Type: String
+    Default: America/Edmonton
+    Description: IANA timezone the schedule is evaluated in (handles daylight saving)
+  MaxAlertsPerEmail:
+    Type: Number
+    Default: 3
+
+Globals:
+  Function:
+    Runtime: nodejs24.x
+    Architectures: [arm64]
+    MemorySize: 256
+    CodeUri: src/
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref SubscriptionsTable
+        TOPIC_ARN: !Ref AlertsTopic
+
+Resources:
+  SubscriptionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ByEmail
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: KEYS_ONLY
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # One topic for everyone. Each email subscription carries a filter policy
+  # so it only receives messages tagged with its own subscriptionId.
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Weather Alerts
+      KmsMasterKeyId: alias/aws/sns
+
+  Api:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      # Public endpoint: throttle it so it can't be used to mass-send confirmation emails.
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 5
+        ThrottlingRateLimit: 2
+      CorsConfiguration:
+        AllowOrigins: ['*']
+        AllowMethods: ['POST', 'OPTIONS']
+        AllowHeaders: ['Content-Type']
+
+  SubscribeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: subscribe.handler
+      Timeout: 10
+      Environment:
+        Variables:
+          MAX_PER_EMAIL: !Ref MaxAlertsPerEmail
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SubscriptionsTable
+        - Statement:
+            - Effect: Allow
+              Action: sns:Subscribe
+              Resource: !Ref AlertsTopic
+      Events:
+        Subscribe:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /subscriptions
+            Method: POST
+
+  CheckFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: check.handler
+      Timeout: 300
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SubscriptionsTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt AlertsTopic.TopicName
+      # Scheduler invokes Lambda asynchronously. If the function itself throws,
+      # Lambda's async retries kick in, then the event lands in this SQS queue.
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        MaximumEventAgeInSeconds: 3600
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+      Events:
+        DailyCheck:
+          Type: ScheduleV2
+          Properties:
+            # Without an explicit name SAM uses "CheckFunctionDailyCheck", which isn't
+            # stack-specific: a second copy of this stack in the same account would clash.
+            Name: !Sub ${AWS::StackName}-daily-check
+            ScheduleExpression: !Ref ScheduleExpression
+            ScheduleExpressionTimezone: !Ref ScheduleTimezone
+            # Covers failures to *deliver* the invocation (throttling, permissions).
+            RetryPolicy:
+              MaximumRetryAttempts: 3
+              MaximumEventAgeInSeconds: 3600
+            DeadLetterConfig:
+              Type: SQS
+
+Outputs:
+  ApiUrl:
+    Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com
+  CheckFunctionName:
+    Value: !Ref CheckFunction
+  SubscriptionsTableName:
+    Value: !Ref SubscriptionsTable
+  AlertsTopicArn:
+    Value: !Ref AlertsTopic
