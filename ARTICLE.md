@@ -553,17 +553,30 @@ aws sns list-subscriptions-by-topic --topic-arn <AlertsTopicArn> \
 aws lambda invoke --function-name <CheckFunctionName> response.json && cat response.json
 ```
 
+On a day the rule triggers and no alert has gone out yet:
+
 ```json
 {"checkHour":"07","subscriptions":1,"locations":1,"sent":1,"not_triggered":0,"already_sent":0,"failed":0}
 ```
 
-You should get the alert email within a minute. **Run the same command again:**
+You should get the alert email within a minute. **Run the same command again** — this is the real output from my stack:
 
 ```json
 {"checkHour":"07","subscriptions":1,"locations":1,"sent":0,"not_triggered":0,"already_sent":1,"failed":0}
 ```
 
-That's idempotency working: no duplicate email.
+That's idempotency working: no duplicate email. It also holds across *different* runs. In my case the scheduled 7 a.m. run had already emailed me that morning, and my manual run later the same day skipped it.
+
+You can also check that the index only returns what's due. Ask for a different hour:
+
+```bash
+aws lambda invoke --function-name <CheckFunctionName> \
+  --cli-binary-format raw-in-base64-out --payload '{"checkHour":"08"}' response.json && cat response.json
+```
+
+```json
+{"checkHour":"08","subscriptions":0,"locations":0,"sent":0,"not_triggered":0,"already_sent":0,"failed":0}
+```
 
 ### 4. Check the guard rails
 
@@ -637,7 +650,7 @@ ByEmail      ACTIVE
 ByCheckHour  CREATING
 ```
 
-**CloudFormation reports success when the GSI is *created*, not when it's *readable*.** DynamoDB keeps filling ("backfilling") the index in the background, and Queries fail until it's `ACTIVE`. If the 7 a.m. schedule had fired in that window, the run would have failed. The two retry layers from Step 6 would probably have covered it, but "probably" isn't a plan.
+**CloudFormation reports success when the GSI is *created*, not when it's *readable*.** On my one-row table the index took about **7 more minutes** to reach `ACTIVE`. DynamoDB keeps filling ("backfilling") the index in the background, and Queries fail until it's `ACTIVE`. If the 7 a.m. schedule had fired in that window, the run would have failed. The two retry layers from Step 6 would probably have covered it, but "probably" isn't a plan.
 
 **The safe way to add a GSI to a live table is two deploys:**
 
