@@ -6,7 +6,23 @@
 // Sorting by locKey means a Query returns subscriptions already grouped by
 // location (rounded to ~1 km), so one forecast call serves the whole group.
 
+import { createHash, randomBytes } from 'node:crypto'
+
 export const DEFAULT_CHECK_HOUR = '07'
+
+/**
+ * One SNS subscription per email address. Its filter policy matches this id,
+ * so every alert for that person (any city) is delivered through it.
+ * A hash, so the raw address never travels in message attributes.
+ */
+export function recipientIdFor(email) {
+  return createHash('sha256').update(email.trim().toLowerCase()).digest('hex').slice(0, 32)
+}
+
+/** Secret for the per-alert unsubscribe link. Guessing an alert id alone isn't enough. */
+export function newUnsubscribeToken() {
+  return randomBytes(24).toString('hex')
+}
 
 /** Normalises an hour (7, "7", "07") to the two-digit string stored in the GSI. */
 export function toCheckHour(hour) {

@@ -7,7 +7,7 @@ import { DEFAULT_CHECK_HOUR, groupSorted, toCheckHour } from './keys.mjs'
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}))
 const sns = new SNSClient({})
-const { TABLE_NAME, TOPIC_ARN } = process.env
+const { TABLE_NAME, TOPIC_ARN, API_URL } = process.env
 const CONCURRENCY = 5
 
 /**
@@ -42,13 +42,15 @@ async function alertOne(sub, daily) {
   const { triggered, value } = evaluate(sub.rule, daily)
   if (!triggered) return 'not_triggered'
 
-  const { subject, message } = formatAlert(sub, daily, value)
+  const unsubscribeUrl = `${API_URL}/unsubscribe?id=${encodeURIComponent(sub.id)}&token=${encodeURIComponent(sub.unsubscribeToken)}`
+  const { subject, message } = formatAlert(sub, daily, value, 0, unsubscribeUrl)
   await sns.send(
     new PublishCommand({
       TopicArn: TOPIC_ARN,
       Subject: subject,
       Message: message,
-      MessageAttributes: { subscriptionId: { DataType: 'String', StringValue: sub.id } },
+      // Routed to this person's single SNS subscription (filter policy: recipientId).
+      MessageAttributes: { recipientId: { DataType: 'String', StringValue: sub.recipientId } },
     }),
   )
   await ddb.send(

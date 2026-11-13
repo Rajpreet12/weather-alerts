@@ -28,3 +28,17 @@ test('groupSorted groups adjacent items from a GSI-sorted Query', () => {
 test('groupSorted handles an empty result', () => {
   assert.deepEqual(groupSorted([]), [])
 })
+
+test('recipientIdFor is stable per email and case-insensitive', async () => {
+  const { recipientIdFor } = await import('../src/keys.mjs')
+  assert.equal(recipientIdFor('A@Example.com '), recipientIdFor('a@example.com'))
+  assert.notEqual(recipientIdFor('a@example.com'), recipientIdFor('b@example.com'))
+  assert.match(recipientIdFor('a@example.com'), /^[0-9a-f]{32}$/)
+})
+
+test('newUnsubscribeToken is 48 hex chars and unique', async () => {
+  const { newUnsubscribeToken } = await import('../src/keys.mjs')
+  const a = newUnsubscribeToken(), b = newUnsubscribeToken()
+  assert.match(a, /^[0-9a-f]{48}$/)
+  assert.notEqual(a, b)
+})

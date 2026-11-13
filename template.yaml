@@ -82,7 +82,7 @@ Resources:
         ThrottlingRateLimit: 2
       CorsConfiguration:
         AllowOrigins: ['*']
-        AllowMethods: ['POST', 'OPTIONS']
+        AllowMethods: ['GET', 'POST', 'OPTIONS']
         AllowHeaders: ['Content-Type']
 
   SubscribeFunction:
@@ -100,6 +100,12 @@ Resources:
             - Effect: Allow
               Action: sns:Subscribe
               Resource: !Ref AlertsTopic
+            # To tell the user whether they still need to click "Confirm subscription".
+            # SNS authorizes this against the TOPIC ARN, not the subscription ARN
+            # (granting "${AlertsTopic}:*" alone fails with AuthorizationErrorException).
+            - Effect: Allow
+              Action: sns:GetSubscriptionAttributes
+              Resource: !Ref AlertsTopic
       Events:
         Subscribe:
           Type: HttpApi
@@ -108,11 +114,46 @@ Resources:
             Path: /subscriptions
             Method: POST
 
+  # GET shows a confirm page, POST removes ONE alert (one city). The SNS
+  # unsubscribe link in the email footer still removes everything for that address.
+  UnsubscribeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: unsubscribe.handler
+      Timeout: 10
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SubscriptionsTable
+        # Only when the last alert for an address is removed.
+        - Statement:
+            - Effect: Allow
+              Action: sns:Unsubscribe
+              Resource:
+                - !Ref AlertsTopic
+                - !Sub ${AlertsTopic}:*
+      Events:
+        ShowConfirm:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /unsubscribe
+            Method: GET
+        Confirm:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /unsubscribe
+            Method: POST
+
   CheckFunction:
     Type: AWS::Serverless::Function
     Properties:
       Handler: check.handler
       Timeout: 300
+      Environment:
+        Variables:
+          # Used to build the per-alert unsubscribe link in each email.
+          API_URL: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref SubscriptionsTable

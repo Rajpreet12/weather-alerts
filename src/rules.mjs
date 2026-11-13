@@ -31,7 +31,7 @@ export function evaluate(rule, daily, dayIndex = 0) {
   return { triggered, value }
 }
 
-export function formatAlert(sub, daily, value, dayIndex = 0) {
+export function formatAlert(sub, daily, value, dayIndex = 0, unsubscribeUrl = null) {
   const def = RULES[sub.rule.type]
   const d = daily
   const date = d.time?.[dayIndex] ?? 'today'
@@ -46,6 +46,7 @@ export function formatAlert(sub, daily, value, dayIndex = 0) {
       `  Snowfall: ${d.snowfall_sum?.[dayIndex]} cm`,
       `  Max wind: ${d.wind_speed_10m_max?.[dayIndex]} km/h`,
       '',
+      ...(unsubscribeUrl ? [`Stop only this ${sub.placeName} alert: ${unsubscribeUrl}`, ''] : []),
       'Weather data by Open-Meteo.com (CC BY 4.0).',
     ].join('\n'),
   }

@@ -47,3 +47,10 @@ test('formatAlert subject stays under the SNS 100-char limit', () => {
   assert.ok(subject.length < 100)
   assert.match(message, /rain chance ≥ 60%/)
 })
+
+test('formatAlert adds a per-alert unsubscribe line only when given a URL', () => {
+  const sub = { placeName: 'Calgary, Alberta, Canada', rule: { type: 'rain', threshold: 60 } }
+  assert.doesNotMatch(formatAlert(sub, daily, 72).message, /Stop only this/)
+  assert.match(formatAlert(sub, daily, 72, 0, 'https://x/unsubscribe?id=1&token=2').message,
+    /Stop only this Calgary, Alberta, Canada alert: https:\/\/x\/unsubscribe\?id=1&token=2/)
+})
