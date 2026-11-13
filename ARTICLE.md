@@ -669,7 +669,7 @@ Real responses from my deployed stack:
 {"error":"Body must be JSON"}                                            [400]
 ```
 
-The per-email cap defaults to 3 (`MaxAlertsPerEmail`). With one alert already set up, two more subscribe calls succeed and the next returns `429 This email already has 3 alerts`. Each successful call sends a confirmation email, so expect those in your inbox.
+The per-email cap defaults to 3 (`MaxAlertsPerEmail`). With one alert already set up, two more subscribe calls succeed and the next returns `429 This email already has 3 alerts`. No extra confirmation email is sent for an address that's already confirmed.
 
 ### 6. Logs
 

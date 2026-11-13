@@ -27,8 +27,7 @@ This is built for **you and a small group: family and friends**, all checked at 
 
 ## Architecture
 
-
-> 📷 **INSERT IMAGE:** `docs/images/1-architecture.png` (alt text: "Architecture: API Gateway and a Subscribe Lambda on the sign-up path; EventBridge Scheduler, a Daily check Lambda, DynamoDB GSI, Open-Meteo and SNS on the alert path")
+[IMAGE: 1-architecture.png]
 
 ### Why these services (and not the alternatives)
 
@@ -108,20 +107,7 @@ npm test
 ```
 
 ```
-✔ rain triggers at or above threshold
-✔ below compares the daily low, inclusive
-✔ above, snow and wind
-✔ missing forecast data never alerts
-✔ validateRule rejects bad input
-✔ formatAlert subject stays under the SNS 100-char limit
-✔ toCheckHour normalises to two digits and rejects bad hours
-✔ locKey rounds to ~1 km and appends the id
-✔ groupSorted groups adjacent items from a GSI-sorted Query
-✔ groupSorted handles an empty result
-✔ recipientIdFor is stable per email and case-insensitive
-✔ newUnsubscribeToken is 48 hex chars and unique
-✔ formatAlert adds a per-alert unsubscribe line only when given a URL
-ℹ pass 13
+ℹ tests 13  ℹ pass 13  ℹ fail 0
 ```
 
 > **Snag to avoid:** if you write your own test script, use plain `node --test`, with no folder argument. It finds every `*.test.mjs` file on Windows, macOS and Linux. Adding a folder (`node --test test/`) silently found **zero** tests on Windows when I tried it. The repo's `npm test` already uses the safe form, so you only hit this if you change it.
@@ -190,9 +176,7 @@ So the design is:
 
 **Why not one topic per city?** Because two people in Calgary have *different rules*: one wants rain alerts, the other cold alerts. A per-city topic would email both every time either rule fired. The decision "does this person get an email today?" has to be made per person, and filter policies do exactly that.
 
-> 📷 **INSERT IMAGE:** `docs/images/2-one-topic-many-inboxes.png` (alt text: "One SNS topic, one subscription per person: a message tagged with recipientId reaches only the matching subscription")
-
-
+[IMAGE: 2-one-topic-many-inboxes.png]
 
 ```js
 // src/subscribe.mjs (core)
@@ -284,22 +268,7 @@ The job must not read the whole table every morning. Instead, every subscription
 | Partition key `checkHour` | `"07"` | *Which subscriptions are due at this hour?* |
 | Sort key `locKey` | `"51.05,-114.09#b780f6ac-…"` | Sorted by location (lat/lon rounded to ~1 km), then id |
 
-```js
-// src/keys.mjs — pure helpers, unit tested
-export const locKey = (lat, lon, id) => `${lat.toFixed(2)},${lon.toFixed(2)}#${id}`
-
-// Items arrive sorted by locKey, so same-city items are adjacent: one pass, no map.
-export function groupSorted(subs) {
-  const groups = []
-  for (const s of subs) {
-    const cell = s.locKey.slice(0, s.locKey.indexOf('#'))
-    const last = groups[groups.length - 1]
-    if (last && last.cell === cell) last.subs.push(s)
-    else groups.push({ cell, latitude: s.latitude, longitude: s.longitude, subs: [s] })
-  }
-  return groups
-}
-```
+`src/keys.mjs` builds `locKey` as `` `${lat.toFixed(2)},${lon.toFixed(2)}#${id}` ``. Because Query returns items sorted by that key, same-city alerts arrive next to each other, and `groupSorted()` groups them in one pass.
 
 ```js
 // src/check.mjs (core)
@@ -362,7 +331,7 @@ async function alertOne(sub, daily) {
   const { triggered, value } = evaluate(sub.rule, daily)
   if (!triggered) return 'not_triggered'
 
-  const { subject, message } = formatAlert(sub, daily, value)
+  const { subject, message } = formatAlert(sub, daily, value, 0, unsubscribeUrl)   // includes "Stop only this alert"
   await sns.send(new PublishCommand({
     TopicArn: TOPIC_ARN, Subject: subject, Message: message,
     MessageAttributes: { recipientId: { DataType: 'String', StringValue: sub.recipientId } },  // → one inbox
@@ -380,9 +349,7 @@ If one city's forecast call fails, the function throws at the end and Lambda ret
 
 The order (publish, *then* record) is deliberate: if Lambda crashes between the two, the worst case is one duplicate email. Recording first would make the worst case a *missed* alert, which is worse for "it's going to be −25°C tonight".
 
-> 📷 **INSERT IMAGE:** `docs/images/3-idempotent-retries.png` (alt text: "Run 1 sends Calgary and Toronto, Paris times out; the retry skips the already-sent ones and only sends Paris")
-
-
+[IMAGE: 3-idempotent-retries.png]
 
 ---
 
@@ -460,42 +427,11 @@ This confused me at first, so it's worth spelling out:
 
 Setting only the Scheduler retry policy looks right but doesn't catch bugs in your function. SAM creates both SQS queues for you when you write `Type: SQS` with no destination.
 
-> 📷 **INSERT IMAGE:** `docs/images/4-two-retry-layers.png` (alt text: "Layer 1: Scheduler retries delivery to Lambda; Layer 2: Lambda retries when your code throws; each ends in an SQS queue")
+[IMAGE: 4-two-retry-layers.png]
 
+### Least privilege and encryption
 
-
-### Least-privilege IAM
-
-Each function gets only what it uses:
-
-```yaml
-  SubscribeFunction:
-    Properties:
-      Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref SubscriptionsTable
-        - Statement:
-            - Effect: Allow
-              Action: sns:Subscribe
-              Resource: !Ref AlertsTopic
-```
-
-The subscribe function can't publish, and the check function can't subscribe anyone.
-
-### Encryption at rest
-
-The table stores email addresses, so it has encryption and point-in-time recovery turned on, and the SNS topic uses the AWS-managed KMS key:
-
-```yaml
-      SSESpecification:
-        SSEEnabled: true
-      PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
-  AlertsTopic:
-    Type: AWS::SNS::Topic
-    Properties:
-      KmsMasterKeyId: alias/aws/sns
-```
+Each function gets only the permissions it uses: the subscribe function can `sns:Subscribe` but not publish, the daily job can publish but not subscribe anyone, and each gets CRUD on only its own table. The table stores email addresses, so it has `SSEEnabled` and point-in-time recovery on, and the SNS topic is encrypted with the AWS-managed key `alias/aws/sns`.
 
 Validate before deploying:
 
@@ -601,11 +537,9 @@ You should get the alert email within a minute. **Run the same command again** �
 {"checkHour":"07","subscriptions":1,"locations":1,"sent":0,"not_triggered":0,"already_sent":1,"failed":0}
 ```
 
-That's idempotency working: no duplicate email.
+That's idempotency working: no duplicate email. It also holds across *different* runs. In my case the scheduled 7 a.m. run had already emailed me that morning, and my manual run later the same day skipped it.
 
-> 📷 **INSERT IMAGE:** `docs/images/5-alert-email.png` (alt text: "The alert email: Heat alert for Calgary, with the forecast and an SNS unsubscribe footer")
-
- It also holds across *different* runs. In my case the scheduled 7 a.m. run had already emailed me that morning, and my manual run later the same day skipped it.
+[IMAGE: 5-alert-email.png]
 
 You can also check that the index only returns what's due. Ask for a different hour:
 
@@ -645,17 +579,7 @@ alerts left: 1 · SNS subscriptions left: 1 (Calgary still works)
 
 ### 5. Check the guard rails
 
-```bash
-# Bad rule → 400
-curl -s -X POST "$API/subscriptions" -H "Content-Type: application/json" \
-  -d '{"email":"you@example.com","city":"Calgary","rule":{"type":"hail","threshold":1}}'
-
-# Unknown city → 404
-curl -s -X POST "$API/subscriptions" -H "Content-Type: application/json" \
-  -d '{"email":"you@example.com","city":"Nowhereville Zzzq","rule":{"type":"rain","threshold":50}}'
-```
-
-Real responses from my deployed stack:
+Send a bad rule, a bad email, an unknown city and a non-JSON body. Real responses from my deployed stack:
 
 ```
 {"error":"rule.type must be one of: rain, snow, below, above, wind"}    [400]
@@ -664,7 +588,7 @@ Real responses from my deployed stack:
 {"error":"Body must be JSON"}                                            [400]
 ```
 
-The per-email cap defaults to 3 (`MaxAlertsPerEmail`). With one alert already set up, two more subscribe calls succeed and the next returns `429 This email already has 3 alerts`. Each successful call sends a confirmation email, so expect those in your inbox.
+The per-email cap defaults to 3 (`MaxAlertsPerEmail`). With one alert already set up, two more subscribe calls succeed and the next returns `429 This email already has 3 alerts`. No extra confirmation email is sent for an address that's already confirmed.
 
 ### 6. Logs
 
@@ -688,9 +612,7 @@ My v1 daily job did `Scan` → group in memory → check. A Scan reads **every i
 
 In v1's "limits" section I'd written "Scan is fine to tens of thousands of rows". That was me defending a shortcut, not a design.
 
-> 📷 **INSERT IMAGE:** `docs/images/6-scan-vs-query.png` (alt text: "v1 Scan reads every row then groups in memory; v2 Query on ByCheckHour reads only rows due at 07, already grouped by city")
-
-
+[IMAGE: 6-scan-vs-query.png]
 
 ### The two options
 
@@ -709,10 +631,7 @@ I deployed the GSI and the new Query code together. `sam deploy` printed `UPDATE
 ValidationException: Cannot read from backfilling global secondary index: ByCheckHour
 ```
 
-```bash
-aws dynamodb describe-table --table-name <SubscriptionsTableName> \
-  --query "Table.GlobalSecondaryIndexes[].[IndexName,IndexStatus]"
-```
+`aws dynamodb describe-table` showed:
 
 ```
 ByEmail      ACTIVE
@@ -729,29 +648,7 @@ ByCheckHour  CREATING
 
 ### Backfilling existing rows
 
-Items written before the change don't have `checkHour` / `locKey`, so the index can't see them. I backfilled them once with a conditional update (safe to re-run, and it won't overwrite rows the new code already wrote):
-
-```python
-# one-off backfill (boto3)
-import boto3
-table = boto3.resource("dynamodb").Table("<SubscriptionsTableName>")
-scan_kwargs = {"ProjectionExpression": "id, latitude, longitude, checkHour"}
-while True:
-    page = table.scan(**scan_kwargs)
-    for it in page["Items"]:
-        if "checkHour" in it:
-            continue
-        lk = f"{float(it['latitude']):.2f},{float(it['longitude']):.2f}#{it['id']}"
-        table.update_item(
-            Key={"id": it["id"]},
-            UpdateExpression="SET checkHour = :h, locKey = :l",
-            ConditionExpression="attribute_not_exists(checkHour)",
-            ExpressionAttributeValues={":h": "07", ":l": lk},
-        )
-    if "LastEvaluatedKey" not in page:
-        break
-    scan_kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
-```
+If you deployed an earlier version, rows written before the change don't have `checkHour` / `locKey`, so the index can't see them. I backfilled them once: a paginated Scan, then for each row an `UpdateItem` with `SET checkHour = :h, locKey = :l` and `ConditionExpression: attribute_not_exists(checkHour)`, so it's safe to re-run and never overwrites rows the new code already wrote. (Fresh deploys don't need this.)
 
 Yes, a migration is the one place a Scan is fine: it runs once, not every morning.
 
@@ -805,7 +702,6 @@ Finally, confirm nothing is left:
 ```bash
 aws cloudformation describe-stacks --stack-name weather-alerts   # → "Stack ... does not exist"
 ```
-
 
 ---
 
