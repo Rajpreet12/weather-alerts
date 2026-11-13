@@ -129,6 +129,7 @@
       <g><rect x="128" y="0" width="56" height="36" rx="8" fill="#f43f5e"/><text x="156" y="23" text-anchor="middle" fill="#fff" font-weight="700">Wed 🔔</text></g>
       <g opacity=".55"><rect x="192" y="0" width="56" height="36" rx="8" fill="none" stroke="#bae6fd"/><text x="220" y="23" text-anchor="middle">Thu</text></g>
       <g opacity=".55"><rect x="256" y="0" width="56" height="36" rx="8" fill="none" stroke="#bae6fd"/><text x="284" y="23" text-anchor="middle">Fri</text></g>
+      <text x="0" y="58" font-size="10.5" fill="#bae6fd">Quiet all week. One email on the day your rule is crossed.</text>
     </g>
   </svg>
   <div class="inner">
@@ -140,9 +141,9 @@
   <div class="meta">
     <div>By <b>Rajpreet</b><br>Code: <b>github.com/Rajpreet12/weather-alerts</b></div>
     <div class="stats">
-      <div><span class="num">~30</span><span class="lbl">minutes</span></div>
-      <div><span class="num">~$0</span><span class="lbl">per month*</span></div>
-      <div><span class="num">0</span><span class="lbl">API keys</span></div>
+      <div><span class="num">~30</span><span class="lbl">min to deploy</span></div>
+      <div><span class="num">~$0</span><span class="lbl">per month, hobby scale</span></div>
+      <div><span class="num">0</span><span class="lbl">API keys needed</span></div>
     </div>
   </div>
 </section>
@@ -150,7 +151,7 @@
 <!-- ======================= INTRO ======================= -->
 <p class="lede">Weather apps tell you <em>everything, every day</em>. A daily forecast notification trains you to swipe it away, so on the one morning it says "−25°C tonight" or "70% chance of rain", you've already stopped reading.</p>
 <p>I wanted the opposite: <strong>silence, unless something I care about is about to happen.</strong> You set a rule like "rain chance ≥ 60%" or "low ≤ −10°C" and get an email at 7 a.m. <em>only on the days that rule is crossed</em>. Every other day, nothing.</p>
-<p>This tutorial builds that, end to end, as a small serverless app you can deploy into your own AWS account in about half an hour. I deployed it, tested it with a real inbox, hit three real problems, and <strong>redesigned part of it after community feedback</strong>. All of that is written up below.</p>
+<p>This tutorial builds that, end to end, as a small serverless app you can deploy into your own AWS account in about half an hour. I deployed it, tested it with a real inbox, hit five real problems, and <strong>redesigned parts of it after community feedback</strong>. All of that is written up below.</p>
 
 <div class="tldr">
   <h3>What you'll walk away with</h3>
@@ -161,6 +162,11 @@
     <li><strong>Production habits:</strong> retries, dead-letter queues, idempotency, abuse limits, least-privilege IAM, encryption</li>
     <li>A <strong>verify</strong> checklist with real outputs, and a one-command <strong>clean up</strong></li>
   </ul>
+</div>
+
+<div class="grid2">
+  <div class="card"><h4>👨‍👩‍👧 Who this is for</h4><p>You plus <strong>family and friends</strong>: tens of people, all checked at 7 a.m. in one home timezone you choose when you deploy. Not millions, so AWS limits never come into play and the cost stays at about zero.</p></div>
+  <div class="card"><h4>📖 How to read this</h4><p><strong>You won't type any application code.</strong> You clone a working repo, deploy it with two commands and verify it. The code in each step shows <em>how that part works</em> and <em>where to change it</em>. Each step explains first, then shows code.</p></div>
 </div>
 
 <h2>The architecture</h2>
@@ -266,7 +272,7 @@
       <text x="494" y="134">sns:Subscribe</text>
       <text x="418" y="148">put</text>
       <text x="300" y="236" font-weight="700" fill="#047857">Query ByCheckHour</text>
-      <text x="500" y="250">publish + subscriptionId</text>
+      <text x="500" y="250">publish + recipientId</text>
       <text x="672" y="262">email</text>
     </g>
   </svg>
@@ -277,7 +283,8 @@
 <table>
   <tr><th style="width:24%">Choice</th><th style="width:44%">Why</th><th>What I gave up</th></tr>
   <tr><td><strong>EventBridge Scheduler</strong><br><span style="color:#64748b;font-size:8.6pt">not a scheduled EventBridge <em>rule</em></span></td><td>Understands <strong>timezones</strong>, so 7 a.m. stays 7 a.m. across daylight saving (rules are UTC-only). Has its own retry policy and dead-letter queue.</td><td>Nothing meaningful. It's the newer, recommended option.</td></tr>
-  <tr><td><strong>SNS email + filter policies</strong><br><span style="color:#64748b;font-size:8.6pt">not SES</span></td><td>SNS sends the confirmation email and adds an <strong>unsubscribe link</strong>. No domain verification and no "SES sandbox" exit request.</td><td>Plain text only, generic sender name, not built for high volume. For a branded product, move to SES.</td></tr>
+  <tr><td><strong>SNS email + filter policies</strong><br><span style="color:#64748b;font-size:8.6pt">not SES</span></td><td><strong>SES</strong> needs a verified sender, and new accounts start in the <em>SES sandbox</em> (you can only email addresses you verified) until AWS approves production access. You'd also build opt-in and unsubscribe yourself. <strong>SNS</strong> gives both for free, and the same topic can later send <strong>mobile push</strong> too.</td><td>Plain text only, generic sender name. For branded HTML email at volume, move to SES.</td></tr>
+  <tr><td><strong>A cloud service</strong><br><span style="color:#64748b;font-size:8.6pt">not a phone app</span></td><td>Runs while your phone is off, no app install, works for anyone with an email address, and one forecast call serves everyone in the same city.</td><td>For one person, a phone app with a background task could do this. The cloud version earns its keep when shared.</td></tr>
   <tr><td><strong>Open-Meteo</strong></td><td>Free, <strong>no API key</strong>, so no secret to manage. Geocoding included.</td><td>Non-commercial use, and you must credit them (the email footer does).</td></tr>
   <tr><td><strong>DynamoDB on-demand + a GSI</strong></td><td>Pay per request; costs nothing while idle. A GSI lets the job <code>Query</code> only what's due, already grouped by city.</td><td>Every write also updates the index. At millions of rows, one <code>checkHour</code> needs sharding.</td></tr>
   <tr><td><strong>Lambda on arm64</strong></td><td>Graviton costs about 20% less per GB-second, and this code has no native dependencies.</td><td>None for pure JavaScript.</td></tr>
@@ -292,13 +299,14 @@ aws sts get-caller-identity     <span class="c"># shows the account you're about
 cd weather-alerts
 npm test</code></pre>
 <div class="grid2">
-  <div class="card"><h4>📁 What's inside</h4><p><code>template.yaml</code>: all the infrastructure<br><code>src/rules.mjs</code>: alert logic, no AWS<br><code>src/weather.mjs</code>: Open-Meteo calls<br><code>src/subscribe.mjs</code>: the signup API<br><code>src/check.mjs</code>: the daily job<br><code>src/keys.mjs</code>: GSI key helpers<br><code>test/</code>: 10 unit tests</p></div>
-  <div class="card"><h4>📦 No <code>npm install</code></h4><p>The Node.js 24 Lambda runtime already includes the AWS SDK v3 and a global <code>fetch</code>, so the deployment package is just five source files. There are no dependencies to keep patched and nothing to bundle.</p></div>
+  <div class="card"><h4>📁 What's inside</h4><p><code>template.yaml</code>: all the infrastructure<br><code>src/rules.mjs</code>: alert logic, no AWS<br><code>src/weather.mjs</code>: Open-Meteo calls<br><code>src/subscribe.mjs</code>: the signup API</p></div>
+  <div class="card"><h4>&nbsp;</h4><p><code>src/unsubscribe.mjs</code>: stop one alert<br><code>src/check.mjs</code>: the daily job<br><code>src/keys.mjs</code>: key helpers<br><code>test/</code>: 13 unit tests</p></div>
 </div>
 
 <!-- ======================= STEP 2 ======================= -->
-<h2><span class="step">STEP 2</span>Write the alert rules as pure logic</h2>
-<p>Everything that decides "should we alert?" lives in one file with <strong>no AWS calls</strong>. That way the code most likely to have bugs is tested in milliseconds, before anything is deployed.</p>
+<h2><span class="step">STEP 2</span>Understand (and customize) the alert rules</h2>
+<p><strong>What it is:</strong> the five rule types live in <code>src/rules.mjs</code> in the repo. It's ordinary source code you can edit <strong>before you deploy</strong>, with no AWS calls in it, so the tests run in milliseconds on your laptop.</p>
+<p><strong>When you'd change it:</strong> to add a rule type. A humidity rule is one new line pointing at an Open-Meteo daily field, plus a comparison.</p>
 <pre><code><span class="c">// src/rules.mjs</span>
 <span class="k">export const</span> RULES = {
   rain:  { label: <span class="s">'Rain'</span>, unit: <span class="s">'%'</span>,  min: <span class="n">1</span>,   max: <span class="n">100</span>, field: <span class="s">'precipitation_probability_max'</span>, ... },
@@ -328,15 +336,24 @@ npm test</code></pre>
 <span class="ok">✔</span> locKey rounds to ~1 km and appends the id
 <span class="ok">✔</span> groupSorted groups adjacent items from a GSI-sorted Query
 <span class="ok">✔</span> groupSorted handles an empty result
-<span class="dim">ℹ</span> pass <span class="ok">10</span>   <span class="dim">ℹ</span> fail <span class="ok">0</span></pre></div>
+<span class="ok">✔</span> recipientIdFor is stable per email and case-insensitive
+<span class="ok">✔</span> newUnsubscribeToken is 48 hex chars and unique
+<span class="ok">✔</span> formatAlert adds a per-alert unsubscribe line only when given a URL
+<span class="dim">ℹ</span> pass <span class="ok">13</span>   <span class="dim">ℹ</span> fail <span class="ok">0</span></pre></div>
 
-<div class="callout bug"><b class="t">Real snag #1</b>My first <code>package.json</code> used <code>"test": "node --test test/"</code>. On Windows that found <strong>zero</strong> tests and reported a failure. Plain <code>node --test</code> auto-discovers <code>*.test.mjs</code> files on every OS.</div>
+<div class="callout warn"><b class="t">Snag to avoid</b>If you write your own test script, use plain <code>node --test</code> with <strong>no folder argument</strong>. It finds every <code>*.test.mjs</code> on Windows, macOS and Linux. Adding a folder (<code>node --test test/</code>) silently found <strong>zero</strong> tests on Windows when I tried it. The repo's <code>npm test</code> already uses the safe form.</div>
 
 <!-- ======================= STEP 3 ======================= -->
-<h2><span class="step">STEP 3</span>Get weather data with no API key</h2>
+<h2><span class="step">STEP 3</span>How the weather data is fetched (no API key)</h2>
+<p><strong>What it does:</strong> <code>src/weather.mjs</code> turns a city name into coordinates and fetches <em>today's</em> forecast from Open-Meteo, which is free and needs no API key, so there's no secret to manage. Two settings matter, and you can change both:</p>
+<ul>
+  <li><strong>Every call has a 5-second timeout.</strong> Without it, a hanging weather API would burn your whole Lambda timeout, and your money. Change <code>timeoutMs</code> for a different limit.</li>
+  <li><strong><code>timezone: 'auto'</code></strong> makes "today" mean today in the city's own timezone, not UTC.</li>
+</ul>
+<p>Here's where both live:</p>
 <pre><code><span class="c">// src/weather.mjs</span>
 <span class="k">async function</span> <span class="f">getJson</span>(url, timeoutMs = <span class="n">5000</span>) {
-  <span class="k">const</span> res = <span class="k">await</span> <span class="f">fetch</span>(url, { signal: AbortSignal.<span class="f">timeout</span>(timeoutMs) })   <span class="c">// never hang</span>
+  <span class="k">const</span> res = <span class="k">await</span> <span class="f">fetch</span>(url, { signal: AbortSignal.<span class="f">timeout</span>(timeoutMs) })   <span class="c">// ← the timeout</span>
   <span class="k">if</span> (!res.ok) <span class="k">throw new</span> Error(<span class="s">`HTTP ${res.status} from ${new URL(url).host}`</span>)
   <span class="k">return</span> res.<span class="f">json</span>()
 }
@@ -345,14 +362,14 @@ npm test</code></pre>
   <span class="k">const</span> params = <span class="k">new</span> URLSearchParams({
     latitude: String(latitude), longitude: String(longitude),
     daily: DAILY_FIELDS.<span class="f">join</span>(<span class="s">','</span>),
-    timezone: <span class="s">'auto'</span>,          <span class="c">// "today" means today where the city is</span>
+    timezone: <span class="s">'auto'</span>,          <span class="c">// ← "today" where the city is</span>
     forecast_days: <span class="s">'1'</span>,
   })
   <span class="k">const</span> data = <span class="k">await</span> <span class="f">getJson</span>(<span class="s">`https://api.open-meteo.com/v1/forecast?${params}`</span>)
   <span class="k">if</span> (!data.daily) <span class="k">throw new</span> Error(<span class="s">'Forecast response had no daily block'</span>)
   <span class="k">return</span> data.daily
 }</code></pre>
-<p>Two details that matter in production: <strong>always put a timeout on <code>fetch</code></strong> (otherwise a hanging third-party API eats your whole Lambda timeout, and your money), and use <code>timezone: 'auto'</code> so the daily values match the city's local calendar day, not UTC. You can try it before touching AWS:</p>
+<p>Try it before touching AWS:</p>
 <div class="term"><div class="bar"><i style="background:#f87171"></i><i style="background:#fbbf24"></i><i style="background:#4ade80"></i><span>local test, real output</span></div>
 <pre><span class="dim">$</span> node -e "import('./src/weather.mjs').then(async m =&gt; { ... geocode('Calgary') ... })"
 { placeName: <span class="s">'Calgary, Alberta, Canada'</span>, latitude: <span class="n">51.05011</span>, longitude: <span class="n">-114.08529</span>,
@@ -361,9 +378,14 @@ npm test</code></pre>
   temperature_2m_min: [<span class="n">3.4</span>], temperature_2m_max: [<span class="n">10.4</span>], wind_speed_10m_max: [<span class="n">33.6</span>] }</pre></div>
 
 <!-- ======================= STEP 4 ======================= -->
-<h2><span class="step">STEP 4</span>Subscribing: let SNS do the email work</h2>
-<p>The trick that keeps this project small: <strong>one SNS topic for everyone</strong>, and a <strong>filter policy</strong> on each email subscription so it only receives messages tagged with its own ID.</p>
-
+<h2><span class="step">STEP 4</span>Subscribing: one topic, one subscription per person</h2>
+<h3>What's a filter policy?</h3>
+<p>An <strong>SNS topic</strong> is a broadcast channel: by default every message goes to <strong>every</strong> subscriber. A <strong>filter policy</strong> is a rule on one subscription that says <em>"only deliver messages whose attributes match this"</em>. Messages carry attributes (key/value tags) set by whoever publishes them. So:</p>
+<ul>
+  <li><strong>One topic</strong> for everyone.</li>
+  <li><strong>One email subscription per person</strong>, filter policy <code>{"recipientId": ["&lt;hash of their email&gt;"]}</code>.</li>
+  <li>The daily job tags each alert with that person's <code>recipientId</code>, so SNS delivers it to that inbox only.</li>
+</ul>
 <figure>
   <svg viewBox="0 0 760 230" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, sans-serif">
     <defs><marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#334155"/></marker>
@@ -372,8 +394,8 @@ npm test</code></pre>
     <!-- message -->
     <rect x="20" y="78" width="190" height="74" rx="12" fill="#0b1220"/>
     <text x="34" y="100" font-family="Consolas, monospace" font-size="10.5" fill="#94a3b8">Publish(</text>
-    <text x="44" y="117" font-family="Consolas, monospace" font-size="10.5" fill="#e2e8f0">subscriptionId =</text>
-    <text x="44" y="134" font-family="Consolas, monospace" font-size="10.5" fill="#fde047">"b780…"</text>
+    <text x="44" y="117" font-family="Consolas, monospace" font-size="10.5" fill="#e2e8f0">recipientId =</text>
+    <text x="44" y="134" font-family="Consolas, monospace" font-size="10.5" fill="#fde047">"3a2c…" (you)</text>
     <text x="34" y="148" font-family="Consolas, monospace" font-size="10.5" fill="#94a3b8">)</text>
     <!-- topic -->
     <rect x="262" y="70" width="150" height="90" rx="45" fill="#f43f5e"/>
@@ -384,65 +406,65 @@ npm test</code></pre>
     <!-- subscribers -->
     <g font-size="10.5">
       <rect x="470" y="18" width="270" height="52" rx="10" fill="#fff" stroke="#e2e8f0"/>
-      <text x="484" y="40" fill="#94a3b8">📭 anna@…</text><text x="484" y="58" font-family="Consolas, monospace" font-size="9.5" fill="#94a3b8">{"subscriptionId":["4c1f…"]}</text>
+      <text x="484" y="40" fill="#94a3b8">📭 anna@…</text><text x="484" y="58" font-family="Consolas, monospace" font-size="9.5" fill="#94a3b8">{"recipientId":["91be…"]}</text>
       <text x="720" y="50" text-anchor="end" font-size="16" fill="#cbd5e1">✕</text>
       <rect x="470" y="88" width="270" height="52" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
-      <text x="484" y="110" fill="#065f46" font-weight="700">📬 you@…</text><text x="484" y="128" font-family="Consolas, monospace" font-size="9.5" fill="#047857">{"subscriptionId":["b780…"]}</text>
+      <text x="484" y="110" fill="#065f46" font-weight="700">📬 you@…</text><text x="484" y="128" font-family="Consolas, monospace" font-size="9.5" fill="#047857">{"recipientId":["3a2c…"]} · 2 alerts</text>
       <text x="720" y="120" text-anchor="end" font-size="16" fill="#10b981" font-weight="700">✓</text>
       <rect x="470" y="158" width="270" height="52" rx="10" fill="#fff" stroke="#e2e8f0"/>
-      <text x="484" y="180" fill="#94a3b8">📭 sam@…</text><text x="484" y="198" font-family="Consolas, monospace" font-size="9.5" fill="#94a3b8">{"subscriptionId":["9ad0…"]}</text>
+      <text x="484" y="180" fill="#94a3b8">📭 sam@…</text><text x="484" y="198" font-family="Consolas, monospace" font-size="9.5" fill="#94a3b8">{"recipientId":["d07e…"]}</text>
       <text x="720" y="190" text-anchor="end" font-size="16" fill="#cbd5e1">✕</text>
     </g>
     <path d="M412 115 H464" stroke="#10b981" stroke-width="2.5" marker-end="url(#a3)"/>
     <path d="M400 88 C430 60 440 46 464 44" stroke="#cbd5e1" stroke-width="1.5" fill="none" stroke-dasharray="4 4"/>
     <path d="M400 142 C430 170 440 184 464 184" stroke="#cbd5e1" stroke-width="1.5" fill="none" stroke-dasharray="4 4"/>
   </svg>
-  <figcaption>Figure 2. One topic, many inboxes. Each message carries a subscriptionId attribute, and only the subscription whose filter policy matches gets the email.</figcaption>
+  <figcaption>Figure 2. One topic, many inboxes. One subscription per person: each message carries a recipientId attribute, and only the subscription whose filter policy matches gets the email, whichever city the alert is for.</figcaption>
 </figure>
-
+<div class="callout info"><b class="t">Why not one topic per city?</b>Two people in Calgary have <em>different rules</em>: one wants rain alerts, the other cold alerts. A per-city topic would email both every time either rule fired. "Does this person get an email today?" is a per-person decision, and that's what filter policies are for.</div>
 <pre><code><span class="c">// src/subscribe.mjs (core)</span>
-<span class="k">const</span> id = <span class="f">randomUUID</span>()
+<span class="k">const</span> id = <span class="f">randomUUID</span>()                       <span class="c">// this alert</span>
+<span class="k">const</span> recipientId = <span class="f">recipientIdFor</span>(email)     <span class="c">// this person: sha256(email), 32 hex chars</span>
 
 <span class="k">const</span> sub = <span class="k">await</span> sns.<span class="f">send</span>(<span class="k">new</span> SubscribeCommand({
-  TopicArn: TOPIC_ARN,
-  Protocol: <span class="s">'email'</span>,
-  Endpoint: email,
-  Attributes: { FilterPolicy: JSON.<span class="f">stringify</span>({ subscriptionId: [id] }) },
+  TopicArn: TOPIC_ARN, Protocol: <span class="s">'email'</span>, Endpoint: email,
+  Attributes: { FilterPolicy: JSON.<span class="f">stringify</span>({ recipientId: [recipientId] }) },
   ReturnSubscriptionArn: <span class="k">true</span>,
 }))
+<span class="k">const</span> attrs = <span class="k">await</span> sns.<span class="f">send</span>(<span class="k">new</span> GetSubscriptionAttributesCommand({ SubscriptionArn: sub.SubscriptionArn }))
+<span class="k">const</span> confirmed = attrs.Attributes?.PendingConfirmation === <span class="s">'false'</span>   <span class="c">// no need to click "Confirm" again</span>
 
-<span class="k">await</span> ddb.<span class="f">send</span>(<span class="k">new</span> PutCommand({
-  TableName: TABLE_NAME,
-  Item: { id, email, ...place, rule: { type: rule.type, threshold: rule.threshold },
-          <span class="c">// keys for the ByCheckHour GSI the daily job queries (Step 5)</span>
-          checkHour: <span class="s">'07'</span>, locKey: <span class="f">locKey</span>(place.latitude, place.longitude, id),
-          snsSubscriptionArn: sub.SubscriptionArn, createdAt: <span class="k">new</span> Date().<span class="f">toISOString</span>() },
-}))</code></pre>
+<span class="k">await</span> ddb.<span class="f">send</span>(<span class="k">new</span> PutCommand({ TableName: TABLE_NAME,
+  Item: { id, email, recipientId, unsubscribeToken: <span class="f">newUnsubscribeToken</span>(), ...place, rule,
+          checkHour: <span class="s">'07'</span>, locKey: <span class="f">locKey</span>(place.latitude, place.longitude, id),   <span class="c">// Step 5's index</span>
+          snsSubscriptionArn: sub.SubscriptionArn, createdAt: <span class="k">new</span> Date().<span class="f">toISOString</span>() } }))</code></pre>
 
+<div class="callout bug"><b class="t">Real snag: a second city for the same email broke</b>My first version gave every <em>alert</em> its own SNS subscription, filtered on the alert id. A reviewer asked "what if I want two cities?" I tried it, and the second signup failed with <code>InvalidParameterException: Subscription already exists with different attributes</code>. <strong>SNS treats topic + protocol + email as one subscription.</strong> Subscribing again with the <em>same</em> attributes just returns the existing one (no new confirmation email); with <em>different</em> attributes it's rejected. The fix is the design above: filter on the <strong>person</strong>, never the alert. A second city now returns <code>"Added to your existing alerts. No confirmation needed."</code></div>
+
+<h3>Stop just one city</h3>
+<p>The SNS footer link stops <em>everything</em>. To stop only "Toronto rain", each alert email also includes <code>Stop only this Toronto, Ontario, Canada alert: https://&lt;api&gt;/unsubscribe?id=…&amp;token=…</code>. <code>src/unsubscribe.mjs</code> handles it in two steps, on purpose:</p>
 <div class="grid2">
-  <div class="card"><h4>✅ Free: double opt-in</h4><p>SNS emails "Subscription Confirmation", and <strong>nothing</strong> is delivered until the person clicks it. Nobody can sign someone else up for alerts.</p></div>
-  <div class="card"><h4>✅ Free: unsubscribe</h4><p>Every alert email has an unsubscribe link at the bottom. No unsubscribe endpoint, token or page to build.</p></div>
+  <div class="card"><h4>GET: show a button, delete nothing</h4><p>Email security scanners in work and school inboxes automatically "click" every link. If a GET deleted the alert, a scanner would silently unsubscribe people.</p></div>
+  <div class="card"><h4>POST: delete, only with the right token</h4><p>A secret per-alert token must match, so knowing an alert id isn't enough. If it was the person's last alert, their SNS subscription is removed too.</p></div>
 </div>
+<div class="callout bug"><b class="t">Real snag: IAM wanted the topic ARN</b>I granted <code>sns:GetSubscriptionAttributes</code> on the subscription ARN (<code>&lt;topic-arn&gt;:*</code>) and got <code>AuthorizationErrorException ... not authorized to perform: SNS:GetSubscriptionAttributes on resource: &lt;topic-arn&gt;</code>. <strong>SNS authorizes this action against the topic ARN.</strong> The fix: <code>Resource: !Ref AlertsTopic</code>.</div>
 
-<h3>Protecting a public endpoint</h3>
-<p>This endpoint has no login, and every successful call makes AWS send an email to an address the <em>caller</em> chose. That's an abuse vector, so there are three layers of defence:</p>
-<pre><code><span class="c">// 1. Validate everything</span>
-<span class="k">if</span> (!EMAIL_RE.<span class="f">test</span>(email)) <span class="k">return</span> <span class="f">json</span>(<span class="n">400</span>, { error: <span class="s">'A valid email is required'</span> })
-<span class="k">if</span> (!city || city.length &gt; <span class="n">80</span>) <span class="k">return</span> <span class="f">json</span>(<span class="n">400</span>, { error: <span class="s">'city is required (max 80 characters)'</span> })
-
-<span class="c">// 2. Cap subscriptions per address (GSI query, COUNT only, so it's cheap)</span>
-<span class="k">const</span> existing = <span class="k">await</span> ddb.<span class="f">send</span>(<span class="k">new</span> QueryCommand({
-  TableName: TABLE_NAME, IndexName: <span class="s">'ByEmail'</span>,
-  KeyConditionExpression: <span class="s">'email = :e'</span>, ExpressionAttributeValues: { <span class="s">':e'</span>: email },
-  Select: <span class="s">'COUNT'</span>,
-}))
-<span class="k">if</span> ((existing.Count ?? <span class="n">0</span>) &gt;= MAX_PER_EMAIL) <span class="k">return</span> <span class="f">json</span>(<span class="n">429</span>, { error: <span class="s">`This email already has ${MAX_PER_EMAIL} alerts`</span> })
-
-<span class="c">// 3. API Gateway throttling: 2 req/s, burst 5 (in template.yaml)</span></code></pre>
-<div class="callout info"><b class="t">Going further</b>For a public launch I'd add AWS WAF rate-based rules or a CAPTCHA in front of the signup form.</div>
+<h3>The threat model for a public signup endpoint</h3>
+<p><code>POST /subscriptions</code> has no login, and a successful call makes AWS email an address <strong>the caller chose</strong>. Input validation keeps bad data out, but it isn't protection. These are the threats, and what handles each:</p>
+<table>
+  <tr><th style="width:17%">Threat</th><th style="width:29%">What it looks like</th><th style="width:28%">What stops it here</th><th>Add for a public launch</th></tr>
+  <tr><td><strong>Inbox bombing</strong></td><td>One victim's address submitted over and over</td><td>Max 3 alerts per address; repeat signups for a confirmed address send no new email</td><td>—</td></tr>
+  <tr><td><strong>Spraying victims</strong></td><td>Thousands of <em>different</em> addresses from one attacker</td><td>API throttling: 2 req/s, burst 5, whole API</td><td><strong>AWS WAF rate-based rule</strong> per source IP</td></tr>
+  <tr><td><strong>Bots</strong></td><td>Scripts filling the form</td><td>Throttling only</td><td><strong>CAPTCHA</strong> (e.g. AWS WAF CAPTCHA)</td></tr>
+  <tr><td><strong>Unwanted alerts</strong></td><td>Signing someone up who didn't ask</td><td>SNS double opt-in</td><td>—</td></tr>
+  <tr><td><strong>Sender reputation</strong></td><td>Spam complaints get your account's SNS email throttled</td><td>All of the above keep unsolicited email rare</td><td>Monitor SNS delivery metrics</td></tr>
+  <tr><td><strong>Unsubscribing others</strong></td><td>Guessing ids, or scanners pre-clicking links</td><td>Secret token + GET shows, POST deletes</td><td>—</td></tr>
+</table>
+<p style="font-size:9.4pt;color:#475569">For the family-and-friends audience this tutorial targets, the right-hand column is optional. For a public product it isn't.</p>
 
 <!-- ======================= STEP 5 ======================= -->
 <h2><span class="step">STEP 5</span>The daily job: fast, polite and retry-safe</h2>
+<p><strong>What it does:</strong> every morning at 7, find the alerts that are due, get one forecast per city, and email only the people whose rule is crossed. You don't need to change this code; it's here so you know where the retry and duplicate-email protection live.</p>
 <p>The job must <strong>not</strong> read the whole table every morning. Every subscription carries two extra attributes that feed a <strong>global secondary index</strong>:</p>
 <table>
   <tr><th>GSI <code style="background:#1e293b;color:#fde68a">ByCheckHour</code></th><th>Example</th><th>Answers</th></tr>
@@ -506,7 +528,7 @@ npm test</code></pre>
   <span class="k">if</span> (!triggered) <span class="k">return</span> <span class="s">'not_triggered'</span>
 
   <span class="k">await</span> sns.<span class="f">send</span>(<span class="k">new</span> PublishCommand({ TopicArn: TOPIC_ARN, Subject: subject, Message: message,
-    MessageAttributes: { subscriptionId: { DataType: <span class="s">'String'</span>, StringValue: sub.id } } }))
+    MessageAttributes: { recipientId: { DataType: <span class="s">'String'</span>, StringValue: sub.recipientId } } }))  <span class="c">// → one inbox</span>
   <span class="k">await</span> ddb.<span class="f">send</span>(<span class="k">new</span> UpdateCommand({ TableName: TABLE_NAME, Key: { id: sub.id },
     UpdateExpression: <span class="s">'SET lastAlertDate = :d'</span>, ExpressionAttributeValues: { <span class="s">':d'</span>: forecastDate } }))
   <span class="k">return</span> <span class="s">'sent'</span>
@@ -658,12 +680,28 @@ Forecast for 2026-11-09:
   Snowfall: 0 cm
   Max wind: 33.6 km/h
 
+Stop only this Calgary, Alberta, Canada alert: https://…/unsubscribe?id=…&amp;token=…
+
 Weather data by Open-Meteo.com (CC BY 4.0).</div>
   <div class="ft">If you wish to stop receiving notifications from this topic, click here to unsubscribe. ← added by SNS</div>
 </div>
-<figcaption style="font-size:8.6pt;color:#64748b;text-align:center;font-style:italic;margin-bottom:12pt">Figure 5. The alert email. The unsubscribe footer comes free from SNS.</figcaption>
+<figcaption style="font-size:8.6pt;color:#64748b;text-align:center;font-style:italic;margin-bottom:12pt">Figure 5. The alert email: a per-alert "stop only this" link, plus the SNS footer that stops everything.</figcaption>
 
-<h3>④ Check the guard rails</h3>
+<h3>④ Add a second city, then stop just that one</h3>
+<div class="term"><div class="bar"><i style="background:#f87171"></i><i style="background:#fbbf24"></i><i style="background:#4ade80"></i><span>real output from my stack</span></div>
+<pre><span class="dim">$</span> curl -s -X POST "$API/subscriptions" -H "Content-Type: application/json" \
+    -d '{"email":"you@example.com","city":"Toronto","rule":{"type":"rain","threshold":50}}'
+{"id":"b92d4b86-…","place":<span class="s">"Toronto, Ontario, Canada"</span>,"rule":"rain chance ≥ 50%",
+ "next":<span class="ok">"Added to your existing alerts. No confirmation needed."</span>}   <span class="ok">[201]</span>
+
+GET  /unsubscribe?id=…&amp;token=…  → <span class="ok">200</span> "Stop this alert?"   <span class="dim">(nothing deleted, 2 alerts remain)</span>
+POST, wrong token             → <span class="err">404</span> "Already stopped"
+POST, right token             → <span class="ok">200</span> "You won't get the Toronto, Ontario, Canada alert any more.
+                                     Your other 1 alert(s) keep working."
+POST again                    → <span class="err">404</span> "Already stopped"
+<span class="dim">alerts left: 1 · SNS subscriptions left: 1 (Calgary still works)</span></pre></div>
+
+<h3>⑤ Check the guard rails</h3>
 <div class="term"><div class="bar"><i style="background:#f87171"></i><i style="background:#fbbf24"></i><i style="background:#4ade80"></i><span>real responses from the deployed API</span></div>
 <pre>bad rule      {"error":"rule.type must be one of: rain, snow, below, above, wind"}   <span class="err">[400]</span>
 bad email     {"error":"A valid email is required"}                                  <span class="err">[400]</span>
@@ -759,6 +797,8 @@ aws cloudformation describe-stacks --stack-name weather-alerts   <span class="c"
   <li><strong>Asynchronous invocations have two retry layers.</strong> Scheduler's retry policy won't catch errors thrown by your own code; Lambda's <code>EventInvokeConfig</code> will.</li>
   <li><strong>Retries need idempotency.</strong> One <code>lastAlertDate</code> field made "retry the whole job" safe.</li>
   <li><strong>Design the table around the question you ask every day.</strong> "Who's due now, grouped by city?" is a GSI Query, not a Scan. A reader spotted it in one sentence.</li>
+  <li><strong>Know what your service treats as "the same thing".</strong> SNS sees topic + protocol + email as one subscription, so per-alert filters broke the second city. Filter on the person, not the alert.</li>
+  <li><strong>State the threat model, then pick controls.</strong> Naming inbox bombing and spraying is what makes WAF and CAPTCHA make sense.</li>
   <li><strong>CloudFormation's "complete" isn't DynamoDB's "ready".</strong> Add a GSI, wait for <code>ACTIVE</code>, <em>then</em> ship the code that reads it.</li>
   <li><strong>Check what your framework named things.</strong> A default name with no stack prefix works fine until the day you deploy a second copy.</li>
 </ol>

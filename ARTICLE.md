@@ -19,6 +19,14 @@ By the end of this tutorial you'll have:
 - Retries, a dead-letter queue, idempotency, abuse limits and least-privilege IAM.
 - A clean-up command that removes all of it.
 
+### Who this is for
+
+This is built for **you and a small group: family and friends**, all checked at 7 a.m. in one home timezone (you pick it when you deploy). Tens of people, not millions. That keeps every AWS limit irrelevant and the cost at about zero. The "Scaling" section says what changes if you ever outgrow that.
+
+### How to read this tutorial
+
+**You won't type any application code.** You clone a working repo, deploy it with two commands, and verify it end to end. The code in each step is there to show *how the part works* and *where to change it* (a new rule type, a different timeout, your timezone). Every step starts with what the part does and why, then shows the code.
+
 ## Architecture
 
 ```
@@ -28,7 +36,7 @@ By the end of this tutorial you'll have:
                                         ▼
                                SubscribeFunction (Lambda)
                                  │  geocode city (Open-Meteo)
-                                 │  sns:Subscribe  + filter policy {subscriptionId:[id]}
+                                 │  sns:Subscribe  (ONE per email) + filter policy {recipientId:[…]}
                                  ▼
                           DynamoDB: Subscriptions  (GSIs: ByEmail, ByCheckHour)
                                  ▲
@@ -38,8 +46,9 @@ By the end of this tutorial you'll have:
                                  │  evaluate rules
                                  ▼
                           SNS topic ──(filter)──► only the matching inbox
-                                 │
-                failures ──► SQS dead-letter queues
+                                 │                         │
+                failures ──► SQS dead-letter queues        └─ "Stop only this alert" link
+                                                              → GET/POST /unsubscribe (Lambda)
 ```
 
 ### Why these services (and not the alternatives)
@@ -47,7 +56,8 @@ By the end of this tutorial you'll have:
 | Choice | Why | What I gave up |
 |---|---|---|
 | **EventBridge Scheduler** (not the older EventBridge *rule* with `schedule`) | Supports a **timezone**, so "7 a.m." stays 7 a.m. across daylight saving. Rules are UTC-only. Also has its own retry policy and DLQ. | Nothing meaningful — it's the newer, recommended option. |
-| **SNS email + filter policies** (not SES) | SNS sends the confirmation email, handles the **unsubscribe link**, and needs no domain verification or "SES sandbox" exit request. One shared topic, and a filter policy per subscription routes each message to one inbox. | Plain-text emails only, the "From" name is generic, and SNS email isn't designed for high volume. For a real product with HTML emails, move to SES. |
+| **SNS email + filter policies** (not SES) | With **Amazon SES** you must verify a sender address or domain, and new accounts start in the *SES sandbox*, where you can only email addresses you've verified yourself until AWS approves production access. You'd also build confirmation and unsubscribe handling yourself. **SNS** sends the confirmation email (double opt-in) and an unsubscribe link for free, and the same topic can later deliver **mobile push** notifications too. | Plain-text emails only and a generic sender name. For branded HTML email at volume, move to SES. |
+| **A cloud service** (not a phone app) | Runs while your phone is off, needs no app install, works for anyone with an email address, and one forecast call serves everyone in the same city. | For a single person, a phone app with a scheduled background task could do this locally. The cloud version earns its keep when you share it. |
 | **Open-Meteo** (not OpenWeather etc.) | Free, **no API key**, so there's no secret to store in Secrets Manager. Has geocoding too. | Free tier is for non-commercial use and you must credit them (the email footer does). |
 | **DynamoDB on-demand + a GSI** | Pay per request; zero cost when idle. A GSI lets the daily job `Query` only what's due, already grouped by city. | Every write also updates the index. At millions of rows, one `checkHour` value needs sharding (see "Scaling"). |
 | **Lambda on arm64 (Graviton)** | ~20% cheaper per GB-second than x86, and this code has no native dependencies. | None for pure JavaScript. |
@@ -76,19 +86,20 @@ template.yaml          # all infrastructure (SAM)
 src/rules.mjs          # pure alert logic — no AWS, unit tested
 src/weather.mjs        # Open-Meteo geocoding + forecast
 src/subscribe.mjs      # POST /subscriptions
+src/unsubscribe.mjs    # GET/POST /unsubscribe (stop one alert)
 src/check.mjs          # daily scheduled job
-src/keys.mjs           # GSI key helpers — pure, unit tested
+src/keys.mjs           # key helpers — pure, unit tested
 test/rules.test.mjs
 test/keys.test.mjs
 ```
 
-There's **no `npm install`** for the Lambdas. Node.js 24 Lambda includes the AWS SDK v3 and a global `fetch`, so the deployment package is just these five files.
-
 ---
 
-## Step 2 — The alert rules (pure logic first)
+## Step 2 — Understand (and customize) the alert rules
 
-I kept everything that decides "should we alert?" in a file with no AWS calls, so it's testable in milliseconds without deploying anything.
+**What it is:** the five rule types (rain, snow, cold, heat, wind) live in `src/rules.mjs` in the repo. It's ordinary source code you can edit **before you deploy**. It has no AWS calls in it, so the tests run in milliseconds on your laptop.
+
+**When you'd change it:** to add a rule type. A humidity rule, for example, is one new line pointing at an Open-Meteo daily field, plus a comparison.
 
 ```js
 // src/rules.mjs
@@ -128,40 +139,40 @@ npm test
 ✔ locKey rounds to ~1 km and appends the id
 ✔ groupSorted groups adjacent items from a GSI-sorted Query
 ✔ groupSorted handles an empty result
-ℹ pass 10
+✔ recipientIdFor is stable per email and case-insensitive
+✔ newUnsubscribeToken is 48 hex chars and unique
+✔ formatAlert adds a per-alert unsubscribe line only when given a URL
+ℹ pass 13
 ```
 
-> **Small snag:** my first `package.json` used `"test": "node --test test/"`. On Windows that ran zero tests and reported a failure. Plain `node --test` (which auto-discovers `*.test.mjs`) works on every OS.
+> **Snag to avoid:** if you write your own test script, use plain `node --test`, with no folder argument. It finds every `*.test.mjs` file on Windows, macOS and Linux. Adding a folder (`node --test test/`) silently found **zero** tests on Windows when I tried it. The repo's `npm test` already uses the safe form, so you only hit this if you change it.
 
 ---
 
-## Step 3 — Weather data with no API key
+## Step 3 — How the weather data is fetched (no API key)
+
+**What it does:** `src/weather.mjs` turns a city name into coordinates (geocoding) and fetches *today's* forecast for those coordinates from Open-Meteo, which is free and needs no API key, so there's no secret to manage.
+
+Two details matter, and both are settings you can change:
+
+- **Every call has a 5-second timeout.** Without it, a hanging weather API would burn your whole Lambda timeout (and your money). Change `timeoutMs` if you need a different limit.
+- **`timezone: 'auto'`** makes "today" mean today *in the city's own timezone*, not UTC.
+
+Here's where both live:
 
 ```js
 // src/weather.mjs
 async function getJson(url, timeoutMs = 5000) {
-  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
+  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })   // ← the timeout
   if (!res.ok) throw new Error(`HTTP ${res.status} from ${new URL(url).host}`)
   return res.json()
-}
-
-export async function geocode(city) {
-  const data = await getJson(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=en`)
-  const r = data.results?.[0]
-  if (!r) return null
-  return {
-    placeName: [r.name, r.admin1, r.country].filter(Boolean).join(', '),
-    latitude: r.latitude,
-    longitude: r.longitude,
-    timezone: r.timezone ?? 'auto',
-  }
 }
 
 export async function getDailyForecast(latitude, longitude) {
   const params = new URLSearchParams({
     latitude: String(latitude), longitude: String(longitude),
     daily: DAILY_FIELDS.join(','),
-    timezone: 'auto',          // "today" means today *where the city is*
+    timezone: 'auto',          // ← "today" where the city is
     forecast_days: '1',
   })
   const data = await getJson(`https://api.open-meteo.com/v1/forecast?${params}`)
@@ -169,11 +180,6 @@ export async function getDailyForecast(latitude, longitude) {
   return data.daily
 }
 ```
-
-Two details that matter in production:
-
-- **Always set a timeout on `fetch`.** Without `AbortSignal.timeout`, a hanging third-party API burns your whole Lambda timeout (and your money).
-- **`timezone: 'auto'`** makes the daily values line up with the city's local calendar day, not UTC.
 
 You can try it locally before touching AWS:
 
@@ -191,63 +197,102 @@ Real output from my run:
 
 ---
 
-## Step 4 — Subscribing: let SNS do the email work
+## Step 4 — Subscribing: one topic, one subscription per person
 
-The trick that keeps this project small: **one SNS topic for everyone, plus a filter policy on each subscription.**
+### What's a filter policy?
+
+An **SNS topic** is a broadcast channel: by default, every message published to it goes to **every** subscriber. A **filter policy** is a rule you attach to one subscription that says *"only deliver messages whose attributes match this"*. Messages carry attributes (key/value tags) set by whoever publishes them.
+
+So the design is:
+
+- **One topic for everyone.**
+- **One email subscription per person**, with the filter policy `{"recipientId": ["<hash of their email>"]}`.
+- The daily job publishes each alert with the attribute `recipientId = <that person's hash>`, so SNS delivers it to that one inbox only.
+
+**Why not one topic per city?** Because two people in Calgary have *different rules*: one wants rain alerts, the other cold alerts. A per-city topic would email both every time either rule fired. The decision "does this person get an email today?" has to be made per person, and filter policies do exactly that.
 
 ```js
 // src/subscribe.mjs (core)
-const id = randomUUID()
+const id = randomUUID()                      // this alert
+const recipientId = recipientIdFor(email)    // this person: sha256(email), first 32 hex chars
 
 const sub = await sns.send(new SubscribeCommand({
   TopicArn: TOPIC_ARN,
   Protocol: 'email',
   Endpoint: email,
-  Attributes: { FilterPolicy: JSON.stringify({ subscriptionId: [id] }) },
+  Attributes: { FilterPolicy: JSON.stringify({ recipientId: [recipientId] }) },
   ReturnSubscriptionArn: true,
 }))
+const attrs = await sns.send(new GetSubscriptionAttributesCommand({ SubscriptionArn: sub.SubscriptionArn }))
+const confirmed = attrs.Attributes?.PendingConfirmation === 'false'   // tell the user if they must click "Confirm"
 
 await ddb.send(new PutCommand({
   TableName: TABLE_NAME,
-  Item: { id, email, ...place, rule: { type: rule.type, threshold: rule.threshold },
-          // keys for the ByCheckHour GSI the daily job queries (Step 5)
-          checkHour: '07', locKey: locKey(place.latitude, place.longitude, id),
+  Item: { id, email, recipientId, unsubscribeToken: newUnsubscribeToken(), ...place,
+          rule: { type: rule.type, threshold: rule.threshold },
+          checkHour: '07', locKey: locKey(place.latitude, place.longitude, id),   // Step 5's index
           snsSubscriptionArn: sub.SubscriptionArn, createdAt: new Date().toISOString() },
 }))
 ```
 
-Later, the daily job publishes to the shared topic with a message attribute `subscriptionId = <id>`. SNS compares it to every subscription's filter policy and delivers to **only** the one that matches. Without the filter policy, every subscriber would get every alert.
+What SNS gives you for free:
 
-What SNS gives you for free here:
+1. **Double opt-in.** The first time an address subscribes, it gets "AWS Notification – Subscription Confirmation", and nothing is delivered until they click *Confirm subscription*. Nobody can sign someone else up.
+2. **"Stop everything".** Every email has an SNS unsubscribe link that removes that person from all alerts.
 
-1. **Double opt-in.** The person gets "AWS Notification – Subscription Confirmation" and nothing is delivered until they click *Confirm subscription*. So nobody can sign someone else up for alerts.
-2. **Unsubscribe.** Every alert email has an unsubscribe link.
+> **Real snag: a second city for the same email broke.** My first version gave every *alert* its own SNS subscription, with a filter on the alert id. A reviewer asked "what if I want two cities?" I tried it, and the second signup failed:
+>
+> ```
+> InvalidParameterException: Invalid parameter: Attributes Reason: Subscription already exists with different attributes
+> ```
+>
+> **SNS treats topic + protocol + email as one subscription.** Calling `Subscribe` again with the *same* attributes just returns the existing subscription (no new confirmation email). With *different* attributes, it's rejected. The fix is the design above: the filter policy depends only on the **person** (`recipientId`), never on the alert. Every alert for that email shares one subscription. A second city now returns `"Added to your existing alerts. No confirmation needed."`
 
-### Protecting a public endpoint
+### Stop just one city
 
-This endpoint has no login, and every successful call makes AWS send an email to an address the caller chose. That's an abuse vector, so there are three layers:
+The SNS link stops *everything*. To stop only "Toronto rain", each alert email also includes its own link:
 
-```js
-// Validate everything
-if (!EMAIL_RE.test(email)) return json(400, { error: 'A valid email is required' })
-if (!city || city.length > 80) return json(400, { error: 'city is required (max 80 characters)' })
-const ruleError = validateRule(rule)
-if (ruleError) return json(400, { error: ruleError })
-
-// Cap subscriptions per address (GSI query, COUNT only)
-const existing = await ddb.send(new QueryCommand({
-  TableName: TABLE_NAME, IndexName: 'ByEmail',
-  KeyConditionExpression: 'email = :e', ExpressionAttributeValues: { ':e': email },
-  Select: 'COUNT',
-}))
-if ((existing.Count ?? 0) >= MAX_PER_EMAIL) return json(429, { error: `This email already has ${MAX_PER_EMAIL} alerts` })
+```
+Stop only this Toronto, Ontario, Canada alert: https://<api>/unsubscribe?id=<alert id>&token=<secret>
 ```
 
-…plus API Gateway throttling (2 requests/second, burst 5) in the template. For a public launch I'd add AWS WAF rate-based rules or a CAPTCHA in front, too.
+`src/unsubscribe.mjs` handles it in two steps, on purpose:
+
+- **GET shows a page with a "Yes, stop this alert" button. It deletes nothing.** Email security scanners (common in work and school inboxes) automatically "click" every link in incoming mail. If a GET deleted the alert, a scanner would silently unsubscribe people.
+- **POST deletes the alert**, but only if the `token` matches the one stored with it, so knowing an alert's id isn't enough. If it was that person's last alert, it also removes their SNS subscription, so nothing is left behind.
+
+```js
+// src/unsubscribe.mjs (core): POST
+const deleted = await ddb.send(new DeleteCommand({
+  TableName: TABLE_NAME, Key: { id },
+  ConditionExpression: 'unsubscribeToken = :t',      // wrong or old token → "Already stopped"
+  ExpressionAttributeValues: { ':t': token },
+  ReturnValues: 'ALL_OLD',
+}))
+```
+
+> **Real snag: IAM wanted the topic ARN.** To say "no confirmation needed", the subscribe function calls `GetSubscriptionAttributes`. I granted it on the *subscription* ARN (`<topic-arn>:*`) and got `AuthorizationErrorException ... not authorized to perform: SNS:GetSubscriptionAttributes on resource: <topic-arn>`. **SNS authorizes this action against the topic ARN.** The fix in `template.yaml` is `Resource: !Ref AlertsTopic`.
+
+### The threat model for a public signup endpoint
+
+`POST /subscriptions` has no login, and a successful call makes AWS send an email to an address **the caller chose**. Input validation (a real-looking email, a city under 80 characters, a known rule type) keeps bad data out, but it isn't protection. These are the threats, and what handles each:
+
+| Threat | What it looks like | What stops it here | What I'd add for a public launch |
+|---|---|---|---|
+| **Inbox bombing** | Someone submits a victim's address over and over, flooding them with AWS confirmation emails | Max 3 alerts per address; repeat signups for an already-confirmed address send no new email | — |
+| **Spraying many victims** | One attacker cycles through *thousands of different* addresses (the per-address cap doesn't help) | API Gateway throttling: 2 requests/second, burst 5, for the whole API | **AWS WAF rate-based rule** per source IP, so one client can't use the whole budget |
+| **Bots** | Scripts filling in the form automatically | Throttling only | **CAPTCHA** (e.g. AWS WAF CAPTCHA) on the signup form |
+| **Unwanted alerts** | Signing someone up who didn't ask | SNS double opt-in: nothing is delivered until the owner confirms | — |
+| **Your sender reputation** | Recipients mark AWS confirmation emails as spam, and AWS can throttle your account's SNS email | All of the above keeps unsolicited emails rare | Monitor SNS delivery metrics |
+| **Unsubscribing someone else** | Guessing alert ids, or a mail scanner pre-clicking links | Secret per-alert token + GET-shows-a-button, POST-deletes | — |
+
+For the "family and friends" audience this tutorial targets, the right-hand column is optional. For a public product it isn't.
 
 ---
 
 ## Step 5 — The daily job
+
+**What it does:** every morning at 7, find the alerts that are due, get one forecast per city, and email only the people whose rule is crossed. You don't need to change this code to use the project; it's here so you know where the retry and duplicate-email protection live.
 
 The job must not read the whole table every morning. Instead, every subscription carries two extra attributes that feed a **global secondary index (GSI)**:
 
@@ -337,7 +382,7 @@ async function alertOne(sub, daily) {
   const { subject, message } = formatAlert(sub, daily, value)
   await sns.send(new PublishCommand({
     TopicArn: TOPIC_ARN, Subject: subject, Message: message,
-    MessageAttributes: { subscriptionId: { DataType: 'String', StringValue: sub.id } },
+    MessageAttributes: { recipientId: { DataType: 'String', StringValue: sub.recipientId } },  // → one inbox
   }))
   await ddb.send(new UpdateCommand({
     TableName: TABLE_NAME, Key: { id: sub.id },
@@ -578,7 +623,32 @@ aws lambda invoke --function-name <CheckFunctionName> \
 {"checkHour":"08","subscriptions":0,"locations":0,"sent":0,"not_triggered":0,"already_sent":0,"failed":0}
 ```
 
-### 4. Check the guard rails
+### 4. Add a second city, then stop just that one
+
+```bash
+curl -s -X POST "$API/subscriptions" -H "Content-Type: application/json" \
+  -d '{"email":"you@example.com","city":"Toronto","rule":{"type":"rain","threshold":50}}'
+```
+
+Real output (no new confirmation email, and still one SNS subscription for the address):
+
+```json
+{"id":"b92d4b86-…","place":"Toronto, Ontario, Canada","rule":"rain chance ≥ 50%",
+ "next":"Added to your existing alerts. No confirmation needed."}
+```
+
+Each alert email has a *"Stop only this … alert"* link. Opening it shows a confirm page; pressing the button removes only that city. These are the real results from testing every path with curl:
+
+```
+GET  /unsubscribe?id=…&token=…     → 200 "Stop this alert?"   (nothing deleted: 2 alerts remain)
+POST with a wrong token            → 404 "Already stopped"
+POST with the right token          → 200 "You won't get the Toronto, Ontario, Canada alert any more.
+                                          Your other 1 alert(s) keep working."
+POST again                         → 404 "Already stopped"
+alerts left: 1 · SNS subscriptions left: 1 (Calgary still works)
+```
+
+### 5. Check the guard rails
 
 ```bash
 # Bad rule → 400
@@ -601,7 +671,7 @@ Real responses from my deployed stack:
 
 The per-email cap defaults to 3 (`MaxAlertsPerEmail`). With one alert already set up, two more subscribe calls succeed and the next returns `429 This email already has 3 alerts`. Each successful call sends a confirmation email, so expect those in your inbox.
 
-### 5. Logs
+### 6. Logs
 
 ```bash
 sam logs --stack-name weather-alerts --name CheckFunction --tail
@@ -747,7 +817,9 @@ aws cloudformation describe-stacks --stack-name weather-alerts   # → "Stack ..
 3. **Async invocations have two retry layers.** Scheduler's retry policy doesn't catch errors thrown by your code; Lambda's `EventInvokeConfig` does.
 4. **Retries need idempotency.** A `lastAlertDate` field is all it took to make "retry the whole job" safe.
 5. **Design the table around the question you ask every day.** "Who's due now, grouped by city?" is a GSI Query, not a Scan. A reader spotted it in one sentence.
-6. **CloudFormation's "complete" isn't DynamoDB's "ready".** Add a GSI, wait for `ACTIVE`, *then* ship code that reads it.
-7. **Keep decision logic pure.** `rules.mjs` has no AWS in it, so the part most likely to have bugs is tested in milliseconds without a deploy.
+6. **Know what your service treats as "the same thing".** SNS sees topic + protocol + email as one subscription, so per-alert filter policies broke the second city. Filter on the person, not the alert.
+7. **State the threat model, then pick controls.** "Validate the email" isn't protection; naming inbox bombing and spraying is what makes WAF and CAPTCHA make sense.
+8. **CloudFormation's "complete" isn't DynamoDB's "ready".** Add a GSI, wait for `ACTIVE`, *then* ship code that reads it.
+9. **Keep decision logic pure.** `rules.mjs` has no AWS in it, so the part most likely to have bugs is tested in milliseconds without a deploy.
 
 **Full code:** https://github.com/Rajpreet12/weather-alerts
