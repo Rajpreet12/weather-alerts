@@ -154,6 +154,8 @@ Resources:
         Variables:
           # Used to build the per-alert unsubscribe link in each email.
           API_URL: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com
+          # Run history is keyed by the local date, same timezone as the schedule.
+          SCHEDULE_TZ: !Ref ScheduleTimezone
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref SubscriptionsTable
@@ -167,6 +169,7 @@ Resources:
         DestinationConfig:
           OnFailure:
             Type: SQS
+            Destination: !GetAtt FailedRunsQueue.Arn
       Events:
         DailyCheck:
           Type: ScheduleV2
@@ -181,11 +184,106 @@ Resources:
               MaximumRetryAttempts: 3
               MaximumEventAgeInSeconds: 3600
             DeadLetterConfig:
-              Type: SQS
+              Arn: !GetAtt SchedulerDeadLetterQueue.Arn
+
+  # Explicit (not SAM-generated) so the dashboard and alarms can name them.
+  FailedRunsQueue:            # Lambda async failures: your code threw 3 times
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+  SchedulerDeadLetterQueue:   # Scheduler couldn't deliver the invocation at all
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  # Public, read-only live status page (aggregate counts only).
+  StatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: status.handler
+      Timeout: 10
+      Environment:
+        Variables:
+          SCHEDULE_TZ: !Ref ScheduleTimezone
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref SubscriptionsTable
+      Events:
+        Status:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /status
+            Method: GET
+
+  # Something landed in a failure queue = a morning run didn't fully work.
+  FailedRunsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-failed-runs
+      AlarmDescription: The daily check threw after all retries
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt FailedRunsQueue.QueueName }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  SchedulerDeliveryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-scheduler-undelivered
+      AlarmDescription: EventBridge Scheduler could not invoke the daily check
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt SchedulerDeadLetterQueue.QueueName }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${AWS::StackName}-dashboard
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            { "type": "text", "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": { "markdown": "## Weather alerts: live\nPublic status page: https://${Api}.execute-api.${AWS::Region}.amazonaws.com/status · daily check ${ScheduleExpression} (${ScheduleTimezone})" } },
+            { "type": "metric", "x": 0, "y": 2, "width": 12, "height": 6,
+              "properties": { "title": "Each morning: what happened to every alert", "region": "${AWS::Region}", "view": "bar", "stacked": true, "stat": "Sum", "period": 86400,
+                "metrics": [ ["WeatherAlerts", "Sent", { "color": "#f43f5e" }], [".", "NotTriggered", { "color": "#94a3b8" }], [".", "AlreadySent", { "color": "#38bdf8" }], [".", "Failed", { "color": "#b91c1c" }] ] } },
+            { "type": "metric", "x": 12, "y": 2, "width": 12, "height": 6,
+              "properties": { "title": "Emails: delivered vs failed (SNS)", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 3600,
+                "metrics": [ ["AWS/SNS", "NumberOfNotificationsDelivered", "TopicName", "${AlertsTopic.TopicName}"], [".", "NumberOfNotificationsFailed", ".", "."] ] } },
+            { "type": "metric", "x": 0, "y": 8, "width": 8, "height": 6,
+              "properties": { "title": "Daily check: errors and run time", "region": "${AWS::Region}", "view": "timeSeries", "period": 3600,
+                "metrics": [ ["AWS/Lambda", "Errors", "FunctionName", "${CheckFunction}", { "stat": "Sum" }], [".", "Duration", ".", ".", { "stat": "Maximum", "yAxis": "right" }] ] } },
+            { "type": "metric", "x": 8, "y": 8, "width": 8, "height": 6,
+              "properties": { "title": "API: requests and errors", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 3600,
+                "metrics": [ ["AWS/ApiGateway", "Count", "ApiId", "${Api}"], [".", "4xx", ".", "."], [".", "5xx", ".", "."] ] } },
+            { "type": "metric", "x": 16, "y": 8, "width": 8, "height": 6,
+              "properties": { "title": "Failure queues (should stay at 0)", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Maximum", "period": 300,
+                "metrics": [ ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${FailedRunsQueue.QueueName}"], ["...", "${SchedulerDeadLetterQueue.QueueName}"] ] } },
+            { "type": "alarm", "x": 0, "y": 14, "width": 24, "height": 2,
+              "properties": { "title": "Alarms", "alarms": [ "${FailedRunsAlarm.Arn}", "${SchedulerDeliveryAlarm.Arn}" ] } }
+          ]
+        }
 
 Outputs:
   ApiUrl:
     Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com
+  StatusPageUrl:
+    Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com/status
+  DashboardUrl:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/${Dashboard}
   CheckFunctionName:
     Value: !Ref CheckFunction
   SubscriptionsTableName:

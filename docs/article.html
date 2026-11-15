@@ -711,6 +711,17 @@ empty table   {"subscriptions":0,"locations":0,"sent":0,...,"failed":0}         
 <p>The per-email cap defaults to 3 (<code>MaxAlertsPerEmail</code>). With one alert already set up, two more subscribe calls succeed and the next returns <code>429</code>. Logs: <code>sam logs --stack-name weather-alerts --name CheckFunction --tail</code>.</p>
 
 <!-- ======================= COST ======================= -->
+<h2><span class="step">STEP 9</span>Watch it run: live status page + dashboard</h2>
+<p><strong>What it does:</strong> two views of the same data. A <strong>public status page</strong> anyone can open, and a private <strong>CloudWatch dashboard</strong> for you. <strong>See mine live:</strong> <a href="https://boul4gyil0.execute-api.us-east-1.amazonaws.com/status">boul4gyil0.execute-api.us-east-1.amazonaws.com/status</a></p>
+<figure><img src="images/8-live-status.png" style="width:100%;border-radius:10pt;display:block" alt="Live status page"><figcaption>Figure 7. The public status page: counts only, refreshes every minute.</figcaption></figure>
+<div class="grid2">
+  <div class="card"><h4>📈 Metrics with no API call</h4><p>At the end of each run the job prints one JSON line in CloudWatch's <strong>Embedded Metric Format</strong>. Lambda turns it into 5 custom metrics (<code>Sent</code>, <code>NotTriggered</code>, <code>AlreadySent</code>, <code>Failed</code>, <code>Subscriptions</code>) with no extra IAM permission.</p></div>
+  <div class="card"><h4>🗓️ One row per day that adds up</h4><p>It also writes a <code>run#&lt;date&gt;</code> row with <code>UpdateItem … ADD</code>, so several runs on one day add up. The row has no <code>checkHour</code> or <code>email</code>, so it never enters either GSI.</p></div>
+</div>
+<p><code>GET /status</code> is a small Lambda behind the <strong>same HTTPS API</strong>, so no S3 site or CloudFront is needed. It counts alerts with the <code>ByCheckHour</code> Query (not a Scan), reads the last 7 run rows with one <code>BatchGetItem</code>, and shows <strong>counts only</strong>. The dashboard is one <code>AWS::CloudWatch::Dashboard</code> resource: daily outcomes, SNS delivered vs failed, Lambda errors, API 4xx/5xx and the two failure queues, plus two alarms that go off if a failure queue ever holds a message.</p>
+<div class="callout bug"><b class="t">Real snag: a test run hid the morning's email</b>My first version used <code>PutItem</code> for the run row. When I ran the job by hand that afternoon, it reported <code>already_sent: 1, sent: 0</code> and <em>replaced</em> the 7 a.m. row, so the page called a morning that had emailed me "quiet". Switching to <code>UpdateItem … ADD</code> fixed it.</div>
+<div class="callout tip"><b class="t">Cost: about $0</b>CloudWatch's always-free tier includes 3 dashboards, 10 custom metrics and 10 alarms; this uses 1, 5 and 2. Without the free tier, about $4.70/month.</div>
+
 <h2>💬 What I changed after community feedback</h2>
 <p>I shared a first draft in the contest Slack. The first comment was blunt and correct:</p>
 <div class="callout info" style="font-style:italic">"Never like seeing a DynamoDB Scan; it looks simple to avoid in this use case (GSI and/or secondary records with a transacted write)."</div>
@@ -800,6 +811,7 @@ aws cloudformation describe-stacks --stack-name weather-alerts   <span class="c"
   <li><strong>Know what your service treats as "the same thing".</strong> SNS sees topic + protocol + email as one subscription, so per-alert filters broke the second city. Filter on the person, not the alert.</li>
   <li><strong>State the threat model, then pick controls.</strong> Naming inbox bombing and spraying is what makes WAF and CAPTCHA make sense.</li>
   <li><strong>CloudFormation's "complete" isn't DynamoDB's "ready".</strong> Add a GSI, wait for <code>ACTIVE</code>, <em>then</em> ship the code that reads it.</li>
+  <li><strong>Make it visible.</strong> A public status page turns "trust me, it runs" into something a reader can open.</li>
   <li><strong>Check what your framework named things.</strong> A default name with no stack prefix works fine until the day you deploy a second copy.</li>
 </ol>
 

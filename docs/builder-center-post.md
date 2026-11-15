@@ -240,6 +240,33 @@ SNS subscriptions left: 1    (Calgary still works)
 
 **5. Guard rails** (real responses): bad rule → `400`, bad email → `400`, unknown city → `404 Couldn't find a place called "Nowhereville Zzzq"`, not JSON → `400`. A 4th alert for one address → `429`.
 
+## Step 9: Watch it run (live status page + dashboard)
+
+**What it does:** two views of the same data. A **public status page** anyone can open (readers, family, contest judges), and a private **CloudWatch dashboard** for you.
+
+**See mine live:** https://boul4gyil0.execute-api.us-east-1.amazonaws.com/status
+
+[IMAGE: 8-live-status.png]
+
+**How it works.** At the end of every run, the daily job does two cheap things:
+
+1. Prints one JSON log line in CloudWatch's **Embedded Metric Format**. Lambda turns it into 5 custom metrics (`Sent`, `NotTriggered`, `AlreadySent`, `Failed`, `Subscriptions`) with no API call and no extra IAM permission.
+2. Writes a `run#<date>` row to the table. Runs on the same day **`ADD` up** instead of overwriting, so a manual test can't hide the 7 a.m. emails. The row has no `checkHour` or `email`, so it never enters either GSI.
+
+```js
+await ddb.send(new UpdateCommand({ TableName: TABLE_NAME, Key: { id: `run#${runDate}` },
+  UpdateExpression: 'SET subscriptions = :subs, finishedAt = :at ADD sent :s, already_sent :as, failed :f, runs :one',
+  ExpressionAttributeValues: { /* ... */ } }))
+```
+
+`GET /status` is a small Lambda behind the **same HTTPS API**, so there's no S3 site and no CloudFront to set up. It counts alerts with the `ByCheckHour` Query (not a Scan), reads the last 7 run rows with one `BatchGetItem`, and returns HTML that refreshes every minute. It shows **counts only, no emails or city names**.
+
+The **CloudWatch dashboard** is one `AWS::CloudWatch::Dashboard` resource in the template: daily outcomes, SNS delivered vs failed, Lambda errors and duration, API 4xx/5xx, and the two failure queues. Two alarms go off if either failure queue ever holds a message. I made both queues explicit resources (instead of letting SAM generate them) so the dashboard and alarms can name them.
+
+> **Real snag: a test run hid the morning's email.** My first version used `PutItem` for the run row. When I ran the job by hand that afternoon, it reported `already_sent: 1, sent: 0` and *replaced* the 7 a.m. row, so the page called a morning that had emailed me "quiet". Switching to `UpdateItem ... ADD` fixed it.
+
+**Cost:** about **$0**. CloudWatch's always-free tier includes 3 dashboards, 10 custom metrics and 10 alarms; this uses 1, 5 and 2. Without the free tier it's about $4.70/month ($3 dashboard + 5 × $0.30 metrics + 2 × $0.10 alarms). The status page is a few Lambda and API calls.
+
 ## What I changed after community feedback
 
 A reviewer's first comment: *never like seeing a DynamoDB Scan here; use a GSI or transacted secondary records.* They were right. My v1 Scanned **every row every morning**, including unsubscribed people and alerts due at other hours, then grouped in memory.
@@ -261,6 +288,7 @@ At hobby scale (~100 subscribers, one run a day) it fits in the AWS Free Tier or
 | DynamoDB on-demand | ~3,000 reads | Cents |
 | SNS email | Triggered days only | 1,000 emails |
 | API Gateway HTTP API | A few hundred calls | 1M (12 months) |
+| CloudWatch dashboard, 5 metrics, 2 alarms | Always on | 3 dashboards, 10 metrics, 10 alarms |
 
 At scale the cost driver is SNS email, and then you'd move to SES anyway.
 
@@ -289,5 +317,6 @@ aws logs describe-log-groups --log-group-name-prefix /aws/lambda/weather-alerts-
 4. **Design the table around the daily question.** "Who's due now, by city?" is a GSI Query, not a Scan.
 5. **State the threat model, then pick controls.** That's what makes WAF and CAPTCHA make sense.
 6. **CloudFormation's "complete" isn't DynamoDB's "ready".**
+7. **Make it visible.** A public status page turns "trust me, it runs" into something a reader can open.
 
 **Full code:** https://github.com/Rajpreet12/weather-alerts

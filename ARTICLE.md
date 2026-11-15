@@ -679,6 +679,33 @@ sam logs --stack-name weather-alerts --name CheckFunction --tail
 
 ---
 
+## Step 9: Watch it run (live status page + dashboard)
+
+**What it does:** two views of the same data. A **public status page** anyone can open (readers, family, contest judges), and a private **CloudWatch dashboard** for you.
+
+**See mine live:** https://boul4gyil0.execute-api.us-east-1.amazonaws.com/status
+
+![Live status page](docs/images/8-live-status.png)
+
+**How it works.** At the end of every run, the daily job does two cheap things:
+
+1. Prints one JSON log line in CloudWatch's **Embedded Metric Format**. Lambda turns it into 5 custom metrics (`Sent`, `NotTriggered`, `AlreadySent`, `Failed`, `Subscriptions`) with no API call and no extra IAM permission.
+2. Writes a `run#<date>` row to the table. Runs on the same day **`ADD` up** instead of overwriting, so a manual test can't hide the 7 a.m. emails. The row has no `checkHour` or `email`, so it never enters either GSI.
+
+```js
+await ddb.send(new UpdateCommand({ TableName: TABLE_NAME, Key: { id: `run#${runDate}` },
+  UpdateExpression: 'SET subscriptions = :subs, finishedAt = :at ADD sent :s, already_sent :as, failed :f, runs :one',
+  ExpressionAttributeValues: { /* ... */ } }))
+```
+
+`GET /status` is a small Lambda behind the **same HTTPS API**, so there's no S3 site and no CloudFront to set up. It counts alerts with the `ByCheckHour` Query (not a Scan), reads the last 7 run rows with one `BatchGetItem`, and returns HTML that refreshes every minute. It shows **counts only, no emails or city names**.
+
+The **CloudWatch dashboard** is one `AWS::CloudWatch::Dashboard` resource in the template: daily outcomes, SNS delivered vs failed, Lambda errors and duration, API 4xx/5xx, and the two failure queues. Two alarms go off if either failure queue ever holds a message. I made both queues explicit resources (instead of letting SAM generate them) so the dashboard and alarms can name them.
+
+> **Real snag: a test run hid the morning's email.** My first version used `PutItem` for the run row. When I ran the job by hand that afternoon, it reported `already_sent: 1, sent: 0` and *replaced* the 7 a.m. row, so the page called a morning that had emailed me "quiet". Switching to `UpdateItem ... ADD` fixed it.
+
+**Cost:** about **$0**. CloudWatch's always-free tier includes 3 dashboards, 10 custom metrics and 10 alarms; this uses 1, 5 and 2. Without the free tier it's about $4.70/month ($3 dashboard + 5 × $0.30 metrics + 2 × $0.10 alarms). The status page is a few Lambda and API calls.
+
 ## What I changed after community feedback
 
 I shared a first draft in the contest Slack. The first comment was blunt and correct: *never like seeing a DynamoDB Scan; it looks simple to avoid here, with a GSI and/or secondary records written in a transaction.*
@@ -769,6 +796,7 @@ At hobby scale (say 100 subscribers, one run a day), everything here fits inside
 | DynamoDB on-demand | ~3,000 reads, a few writes | Cents at most |
 | SNS email | only triggered days | Free tier: 1,000 email notifications/month |
 | API Gateway HTTP API | a few hundred requests | Free tier: 1 million/month for 12 months |
+| CloudWatch dashboard + 5 custom metrics + 2 alarms | always on | Always free: 3 dashboards, 10 metrics, 10 alarms |
 | Open-Meteo | 30 × number of distinct cities | Free (non-commercial) |
 
 Check current prices on the [AWS pricing pages](https://aws.amazon.com/pricing/) for your region. The real cost driver at scale would be SNS email volume, and at that point you'd move to SES anyway.
