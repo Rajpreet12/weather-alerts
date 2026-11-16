@@ -259,7 +259,7 @@ Resources:
               "properties": { "markdown": "## Weather alerts: live\nPublic status page: https://${Api}.execute-api.${AWS::Region}.amazonaws.com/status · daily check ${ScheduleExpression} (${ScheduleTimezone})" } },
             { "type": "metric", "x": 0, "y": 2, "width": 12, "height": 6,
               "properties": { "title": "Each morning: what happened to every alert", "region": "${AWS::Region}", "view": "bar", "stacked": true, "stat": "Sum", "period": 86400,
-                "metrics": [ ["WeatherAlerts", "Sent", { "color": "#f43f5e" }], [".", "NotTriggered", { "color": "#94a3b8" }], [".", "AlreadySent", { "color": "#38bdf8" }], [".", "Failed", { "color": "#b91c1c" }] ] } },
+                "metrics": [ ["WeatherAlerts", "Sent", { "color": "#f59e0b" }], [".", "NotTriggered", { "color": "#94a3b8" }], [".", "AlreadySent", { "color": "#38bdf8" }], [".", "Failed", { "color": "#ef4444" }] ] } },
             { "type": "metric", "x": 12, "y": 2, "width": 12, "height": 6,
               "properties": { "title": "Emails: delivered vs failed (SNS)", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 3600,
                 "metrics": [ ["AWS/SNS", "NumberOfNotificationsDelivered", "TopicName", "${AlertsTopic.TopicName}"], [".", "NumberOfNotificationsFailed", ".", "."] ] } },

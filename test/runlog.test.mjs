@@ -33,3 +33,10 @@ test('status page shows counts and escapes the timezone', () => {
   assert.match(html, /no run/)
   assert.doesNotMatch(html, /<script>/)
 })
+
+test('status page marks days rebuilt from logs', () => {
+  const html = renderStatusPage({ alerts: 1, cities: 1, timezone: 'UTC', checkHour: '07',
+    days: [{ date: '2026-11-14', run: { subscriptions: 1, sent: 1, not_triggered: 0, already_sent: 0, failed: 0, source: 'cloudwatch-logs-backfill' } }] })
+  assert.match(html, /Nov 14 ↺/)
+  assert.match(html, /rebuilt from the job's CloudWatch Logs/)
+})
